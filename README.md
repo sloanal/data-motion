@@ -12,6 +12,12 @@ npm run dev
 
 ## Deployment
 
-Pushes to `main` deploy automatically to GitHub Pages:
+Publish the current `main` branch to GitHub Pages:
+
+```bash
+npm run deploy
+```
+
+Live site:
 
 https://sloanal.github.io/relay-sandbox/
