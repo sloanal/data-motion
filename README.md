@@ -20,4 +20,4 @@ npm run deploy
 
 Live site:
 
-https://sloanal.github.io/relay-sandbox/
+https://sloanal.github.io/data-motion/
