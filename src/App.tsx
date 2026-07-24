@@ -14,6 +14,7 @@ import {
   MoreHorizontal,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Settings2,
   ShieldCheck,
@@ -25,6 +26,14 @@ import {
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 
 const NETWORKS = ["Commercial", "NIPR", "SIPR", "JWICS", "SAP"] as const;
+const READ_ONLY_REASON =
+  "View-only access: only the owner or an editor with write access can make this change.";
+const OWNER_ONLY_APPROVAL_REASON =
+  "Owner-only setting: editors cannot turn owner approvals on or off.";
+const OWNER_ONLY_PROMOTION_REASON =
+  "Owner-only setting: editors cannot turn promotion on or off.";
+const OWNER_ONLY_DEMOTION_REASON =
+  "Owner-only setting: only the object-of-origin owner can configure demotion.";
 type Network = (typeof NETWORKS)[number];
 type Permission = "none" | "read" | "write" | "owner";
 
@@ -53,6 +62,24 @@ type PromotedCopySnapshot = DemotedSnapshot & {
   outOfSync: boolean;
   differences: string[];
   lastLocalEditAt?: string;
+  localDependencies?: [string, string][];
+  access?: Access[];
+  promotion?: boolean;
+  promotedFromUserId?: string;
+  reconciledCandidateSignature?: string;
+};
+
+type PromotionCandidate = {
+  stateId: string;
+  holderUserId: string;
+  holderName: string;
+  network: Network;
+  start: number;
+  duration: number;
+  lastSyncedAt?: string;
+  permission: Permission;
+  outOfSync: boolean;
+  differences: string[];
 };
 
 type ScheduleItem = {
@@ -256,6 +283,77 @@ function formatSyncTime(value?: string) {
   });
 }
 
+function getPromotionCandidates(
+  item: ScheduleItem,
+  owner: Persona,
+  recipient: Persona,
+  personas: Persona[],
+): PromotionCandidate[] {
+  const recipientLevel = NETWORKS.indexOf(recipient.network);
+  const candidates: PromotionCandidate[] = [];
+  const originPermission = item.access.find((entry) =>
+    entry.userId === recipient.id
+  )?.permission;
+  if (
+    item.promotion &&
+    originPermission &&
+    originPermission !== "none" &&
+    recipientLevel > NETWORKS.indexOf(owner.network)
+  ) {
+    candidates.push({
+      stateId: `origin:${owner.id}`,
+      holderUserId: owner.id,
+      holderName: `${owner.name} · object of origin`,
+      network: owner.network,
+      start: item.start,
+      duration: item.duration,
+      lastSyncedAt: item.lastSyncedAt,
+      permission: originPermission,
+      outOfSync: false,
+      differences: [],
+    });
+  }
+
+  Object.entries(item.promotedCopies ?? {}).forEach(([holderUserId, copy]) => {
+    if (holderUserId === recipient.id || !copy.promotion) return;
+    const holder = personas.find((persona) => persona.id === holderUserId);
+    const permission = copy.access?.find((entry) =>
+      entry.userId === recipient.id
+    )?.permission;
+    if (
+      !holder ||
+      !permission ||
+      permission === "none" ||
+      recipientLevel <= NETWORKS.indexOf(holder.network)
+    ) {
+      return;
+    }
+    candidates.push({
+      stateId: `copy:${holderUserId}`,
+      holderUserId,
+      holderName: `${holder.name} · synced state`,
+      network: holder.network,
+      start: copy.start,
+      duration: copy.duration,
+      lastSyncedAt: copy.lastSyncedAt,
+      permission,
+      outOfSync: copy.outOfSync,
+      differences: copy.differences,
+    });
+  });
+
+  return candidates;
+}
+
+function promotionCandidateSignature(candidates: PromotionCandidate[]) {
+  return candidates
+    .map((candidate) =>
+      `${candidate.stateId}:${candidate.start}:${candidate.duration}`
+    )
+    .sort()
+    .join("|");
+}
+
 function shiftConnectedItems(
   personas: Persona[],
   itemId: string,
@@ -347,6 +445,63 @@ function shiftConnectedItems(
   }));
 }
 
+function isHighSideOnlyRequest(
+  request: ApprovalRequest,
+  item: ScheduleItem,
+  owner: Persona,
+  personas: Persona[],
+) {
+  const editor = personas.find((persona) =>
+    persona.id === request.editorUserId
+  );
+  return Boolean(
+    editor &&
+      item.promotion &&
+      !item.demotion &&
+      NETWORKS.indexOf(editor.network) > NETWORKS.indexOf(owner.network),
+  );
+}
+
+function normalizeApprovalBoundaries(personas: Persona[]) {
+  return personas.map((owner) => ({
+    ...owner,
+    items: owner.items.map((item) => {
+      const blockedRequests = (item.pendingApprovals ?? []).filter((request) =>
+        isHighSideOnlyRequest(request, item, owner, personas)
+      );
+      if (blockedRequests.length === 0) return item;
+      const promotedCopies = { ...item.promotedCopies };
+      blockedRequests.forEach((request) => {
+        const requestedStart = request.requestedStart ?? item.start;
+        const differenceDays = Math.max(
+          1,
+          Math.round(Math.abs(requestedStart - item.start) * 1.2),
+        );
+        promotedCopies[request.editorUserId] = {
+          start: requestedStart,
+          duration: item.duration,
+          lastSyncedAt: item.lastSyncedAt ?? request.submittedAt,
+          outOfSync: true,
+          differences: [
+            `Start date is ${differenceDays} days ${
+              requestedStart >= item.start ? "later" : "earlier"
+            } than the source`,
+            "Local edit has not propagated to lower networks",
+          ],
+          lastLocalEditAt: request.submittedAt,
+        };
+      });
+      return {
+        ...item,
+        promotedCopies,
+        pendingApprovals: (item.pendingApprovals ?? []).filter((request) =>
+          !isHighSideOnlyRequest(request, item, owner, personas)
+        ),
+      };
+    }),
+  }));
+}
+
 const DEFAULTS = createDefaultPersonas();
 const STORAGE_KEY = "relay-sandbox-v1";
 
@@ -355,11 +510,13 @@ function Toggle({
   onChange,
   disabled = false,
   label,
+  disabledReason,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   disabled?: boolean;
   label: string;
+  disabledReason?: string;
 }) {
   return (
     <button
@@ -368,6 +525,7 @@ function Toggle({
       aria-checked={checked}
       aria-label={label}
       disabled={disabled}
+      title={disabled ? disabledReason : undefined}
       className={`toggle ${checked ? "is-on" : ""}`}
       onClick={() => onChange(!checked)}
     >
@@ -380,7 +538,7 @@ function App() {
   const [personas, setPersonas] = useState<Persona[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      return saved ? JSON.parse(saved) : DEFAULTS;
+      return saved ? normalizeApprovalBoundaries(JSON.parse(saved)) : DEFAULTS;
     } catch {
       return DEFAULTS;
     }
@@ -391,6 +549,10 @@ function App() {
   >(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setPersonas((current) => normalizeApprovalBoundaries(current));
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -462,6 +624,58 @@ function App() {
           }
           : persona
       )
+    );
+  }
+
+  function updatePromotedCopy(
+    ownerId: string,
+    itemId: string,
+    holderUserId: string,
+    patch: Partial<PromotedCopySnapshot>,
+  ) {
+    setPersonas((current) =>
+      current.map((persona) => {
+        if (persona.id !== ownerId) return persona;
+        return {
+          ...persona,
+          items: persona.items.map((item) => {
+            if (item.id !== itemId) return item;
+            const existing = item.promotedCopies?.[holderUserId];
+            const holderState: PromotedCopySnapshot = {
+              start: existing?.start ?? item.start,
+              duration: existing?.duration ?? item.duration,
+              lastSyncedAt: existing?.lastSyncedAt ??
+                item.lastSyncedAt ??
+                new Date().toISOString(),
+              outOfSync: existing?.outOfSync ?? false,
+              differences: existing?.differences ?? [],
+              ...existing,
+              ...patch,
+            };
+            const promotedCopies = {
+              ...item.promotedCopies,
+              [holderUserId]: holderState,
+            };
+            holderState.access?.forEach((entry) => {
+              if (
+                entry.permission === "none" ||
+                promotedCopies[entry.userId]
+              ) {
+                return;
+              }
+              promotedCopies[entry.userId] = {
+                start: holderState.start,
+                duration: holderState.duration,
+                lastSyncedAt: holderState.lastSyncedAt,
+                outOfSync: holderState.outOfSync,
+                differences: [...holderState.differences],
+                promotedFromUserId: holderUserId,
+              };
+            });
+            return { ...item, promotedCopies };
+          }),
+        };
+      })
     );
   }
 
@@ -543,21 +757,44 @@ function App() {
                 : []),
               "Local edit has not propagated to lower networks",
             ];
+            const promotedCopies = {
+              ...item.promotedCopies,
+              [editorUserId]: {
+                ...existing,
+                start: nextStart,
+                duration: existing?.duration ?? item.duration,
+                lastSyncedAt: existing?.lastSyncedAt ??
+                  item.lastSyncedAt ??
+                  editedAt,
+                outOfSync: true,
+                differences,
+                lastLocalEditAt: editedAt,
+              },
+            };
+            Object.entries(promotedCopies).forEach(([holderId, copy]) => {
+              if (
+                holderId === editorUserId ||
+                copy.promotedFromUserId !== editorUserId
+              ) {
+                return;
+              }
+              promotedCopies[holderId] = {
+                ...copy,
+                start: nextStart,
+                duration: existing?.duration ?? item.duration,
+                lastSyncedAt: editedAt,
+                outOfSync: true,
+                differences: Array.from(
+                  new Set([
+                    ...differences,
+                    "Inherited from an out-of-sync promoted state",
+                  ]),
+                ),
+              };
+            });
             return {
               ...item,
-              promotedCopies: {
-                ...item.promotedCopies,
-                [editorUserId]: {
-                  start: nextStart,
-                  duration: existing?.duration ?? item.duration,
-                  lastSyncedAt: existing?.lastSyncedAt ??
-                    item.lastSyncedAt ??
-                    editedAt,
-                  outOfSync: true,
-                  differences,
-                  lastLocalEditAt: editedAt,
-                },
-              },
+              promotedCopies,
             };
           }),
         }));
@@ -661,6 +898,136 @@ function App() {
     });
   }
 
+  function resolveSyncConflict(
+    ownerId: string,
+    itemId: string,
+    viewerId: string,
+    resolution: "source" | "local",
+  ) {
+    setPersonas((current) => {
+      const sourceItem = current
+        .find((persona) => persona.id === ownerId)
+        ?.items.find((item) => item.id === itemId);
+      const copy = sourceItem?.promotedCopies?.[viewerId];
+      if (!sourceItem || !copy) return current;
+
+      return current.map((persona) => {
+        const withoutLocalDependencies = resolution === "source" &&
+            persona.id === viewerId
+          ? {
+            ...persona,
+            dependencies: persona.dependencies.filter(([fromId, toId]) =>
+              !copy.localDependencies?.some(([localFrom, localTo]) =>
+                localFrom === fromId && localTo === toId
+              )
+            ),
+          }
+          : persona;
+        if (persona.id !== ownerId) return withoutLocalDependencies;
+        return {
+          ...withoutLocalDependencies,
+          items: withoutLocalDependencies.items.map((item) => {
+            if (item.id !== itemId || !item.promotedCopies?.[viewerId]) {
+              return item;
+            }
+            if (resolution === "source") {
+              const { [viewerId]: _, ...remainingCopies } = item.promotedCopies;
+              return { ...item, promotedCopies: remainingCopies };
+            }
+            return {
+              ...item,
+              promotedCopies: {
+                ...item.promotedCopies,
+                [viewerId]: {
+                  ...copy,
+                  outOfSync: true,
+                  differences: [
+                    ...copy.differences.filter((difference) =>
+                      difference !==
+                        "Source schedule changed after the local edit"
+                    ),
+                    "High-side version retained after the source changed",
+                  ],
+                },
+              },
+            };
+          }),
+        };
+      });
+    });
+  }
+
+  function reconcilePromotionState(
+    ownerId: string,
+    itemId: string,
+    viewerId: string,
+    stateId: string | "local",
+  ) {
+    setPersonas((current) => {
+      const owner = current.find((persona) => persona.id === ownerId);
+      const viewer = current.find((persona) => persona.id === viewerId);
+      const item = owner?.items.find((entry) => entry.id === itemId);
+      if (!owner || !viewer || !item) return current;
+      const candidates = getPromotionCandidates(item, owner, viewer, current);
+      const existing = item.promotedCopies?.[viewerId];
+      const selected = candidates.find((candidate) =>
+        candidate.stateId === stateId
+      );
+      if (stateId !== "local" && !selected) return current;
+      const base = selected ?? candidates[0];
+      if (!base && !existing) return current;
+
+      return current.map((persona) =>
+        persona.id === ownerId
+          ? {
+            ...persona,
+            items: persona.items.map((entry) =>
+              entry.id === itemId
+                ? {
+                  ...entry,
+                  promotedCopies: {
+                    ...entry.promotedCopies,
+                    [viewerId]: {
+                      start: stateId === "local"
+                        ? existing?.start ?? base!.start
+                        : selected!.start,
+                      duration: stateId === "local"
+                        ? existing?.duration ?? base!.duration
+                        : selected!.duration,
+                      lastSyncedAt: stateId === "local"
+                        ? existing?.lastSyncedAt ??
+                          base?.lastSyncedAt ??
+                          new Date().toISOString()
+                        : selected!.lastSyncedAt ??
+                          new Date().toISOString(),
+                      outOfSync: stateId === "local"
+                        ? true
+                        : selected!.outOfSync,
+                      differences: stateId === "local"
+                        ? [
+                          ...(existing?.differences ?? []),
+                          "Independent local state retained",
+                        ]
+                        : [...selected!.differences],
+                      access: existing?.access,
+                      promotion: existing?.promotion,
+                      promotedFromUserId: stateId === "local"
+                        ? existing?.promotedFromUserId
+                        : selected!.holderUserId,
+                      reconciledCandidateSignature: promotionCandidateSignature(
+                        candidates,
+                      ),
+                    },
+                  },
+                }
+                : entry
+            ),
+          }
+          : persona
+      );
+    });
+  }
+
   function addPersona() {
     if (personas.length >= 6) return;
     const used = new Set(personas.map((p) => p.name));
@@ -721,6 +1088,58 @@ function App() {
           (item.id === dependency[0] || item.id === dependency[1]) &&
           item.approvals
         );
+        const isHighSideLocalEdit = Boolean(
+          approvalOwner &&
+            approvalItem?.promotion &&
+            !approvalItem.demotion &&
+            NETWORKS.indexOf(viewer!.network) >
+              NETWORKS.indexOf(approvalOwner.network),
+        );
+        if (approvalOwner && approvalItem && isHighSideLocalEdit) {
+          const editedAt = new Date().toISOString();
+          return current.map((persona) => {
+            const withDependency = persona.id === viewingUserId
+              ? {
+                ...persona,
+                dependencies: [...persona.dependencies, dependency],
+              }
+              : persona;
+            if (persona.id !== approvalOwner.id) return withDependency;
+            return {
+              ...withDependency,
+              items: withDependency.items.map((item) => {
+                if (item.id !== approvalItem.id) return item;
+                const existing = item.promotedCopies?.[viewingUserId];
+                return {
+                  ...item,
+                  promotedCopies: {
+                    ...item.promotedCopies,
+                    [viewingUserId]: {
+                      start: existing?.start ?? item.start,
+                      duration: existing?.duration ?? item.duration,
+                      lastSyncedAt: existing?.lastSyncedAt ??
+                        item.lastSyncedAt ??
+                        editedAt,
+                      outOfSync: true,
+                      differences: Array.from(
+                        new Set([
+                          ...(existing?.differences ?? []),
+                          "Dependency timing differs from the source schedule",
+                          "Local edit has not propagated to lower networks",
+                        ]),
+                      ),
+                      lastLocalEditAt: editedAt,
+                      localDependencies: [
+                        ...(existing?.localDependencies ?? []),
+                        dependency,
+                      ],
+                    },
+                  },
+                };
+              }),
+            };
+          });
+        }
         if (approvalOwner && approvalItem) {
           return current.map((persona) =>
             persona.id === approvalOwner.id
@@ -788,7 +1207,7 @@ function App() {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `relay-scenario-${
+    anchor.download = `data-motion-scenario-${
       new Date().toISOString().slice(0, 10)
     }.json`;
     anchor.click();
@@ -802,13 +1221,26 @@ function App() {
       try {
         const value = JSON.parse(text);
         if (Array.isArray(value.personas)) {
-          setPersonas(value.personas.slice(0, 6));
+          setPersonas(normalizeApprovalBoundaries(value.personas.slice(0, 6)));
         }
       } catch {
-        window.alert("That file is not a valid Relay scenario.");
+        window.alert("That file is not a valid Data Motion scenario.");
       }
     });
     event.target.value = "";
+  }
+
+  function resetScenario() {
+    if (
+      !window.confirm(
+        "Reset every browser, schedule, permission, and approval to its original state?",
+      )
+    ) {
+      return;
+    }
+    setPersonas(createDefaultPersonas());
+    setModal(null);
+    setLinking(null);
   }
 
   return (
@@ -819,7 +1251,7 @@ function App() {
             <GitBranch size={20} />
           </div>
           <div>
-            <strong>RELAY</strong>
+            <strong>DATA MOTION</strong>
             <span>Federated schedule sandbox</span>
           </div>
         </div>
@@ -828,6 +1260,9 @@ function App() {
           {savedAt ? `Saved locally · ${savedAt}` : "Local scenario"}
         </div>
         <div className="topbar-actions">
+          <button className="icon-button labelled" onClick={resetScenario}>
+            <RotateCcw size={16} /> Reset
+          </button>
           <button
             className="icon-button labelled"
             onClick={() => fileRef.current?.click()}
@@ -892,19 +1327,24 @@ function App() {
                   .flatMap((item) => {
                     const recipientLevel = NETWORKS.indexOf(persona.network);
                     const sourceLevel = NETWORKS.indexOf(source.network);
-                    const hasAccess = item.access.some((entry) =>
+                    const hasOriginAccess = item.access.some((entry) =>
                       entry.userId === persona.id &&
                       entry.permission !== "none"
                     );
-                    const isDemotedCopy = hasAccess &&
+                    const isDemotedCopy = hasOriginAccess &&
                       recipientLevel < sourceLevel &&
                       item.destination === persona.network &&
                       Boolean(item.demotion || item.demotedSnapshot);
-                    const isPromotedCopy = hasAccess &&
-                      item.promotion &&
-                      recipientLevel > sourceLevel;
+                    const promotionCandidates = getPromotionCandidates(
+                      item,
+                      source,
+                      persona,
+                      personas,
+                    );
+                    const isPromotedCopy = promotionCandidates.length > 0;
                     if (!isDemotedCopy && !isPromotedCopy) return [];
                     const promotedSnapshot = item.promotedCopies?.[persona.id];
+                    const inheritedPromotionState = promotionCandidates[0];
                     const displayedItem = isDemotedCopy && item.demotedSnapshot
                       ? {
                         ...item,
@@ -918,6 +1358,14 @@ function App() {
                         ...promotedSnapshot,
                         pendingApprovals: [],
                       }
+                      : isPromotedCopy && inheritedPromotionState
+                      ? {
+                        ...item,
+                        start: inheritedPromotionState.start,
+                        duration: inheritedPromotionState.duration,
+                        lastSyncedAt: inheritedPromotionState.lastSyncedAt,
+                        pendingApprovals: [],
+                      }
                       : item;
                     return [{
                       item: displayedItem,
@@ -928,10 +1376,29 @@ function App() {
                         | "demoted"
                         | "promoted",
                       copyOutOfSync: isPromotedCopy &&
-                        Boolean(promotedSnapshot?.outOfSync),
+                        Boolean(
+                          promotedSnapshot?.outOfSync ??
+                            inheritedPromotionState?.outOfSync,
+                        ),
                       differences: isPromotedCopy
-                        ? promotedSnapshot?.differences ?? []
+                        ? promotedSnapshot?.differences ??
+                          inheritedPromotionState?.differences ??
+                          []
                         : [],
+                      promotionConflict: isPromotedCopy &&
+                        promotionCandidates.length > 1 &&
+                        promotedSnapshot?.reconciledCandidateSignature !==
+                          promotionCandidateSignature(promotionCandidates),
+                      promotionCandidates,
+                      permission: isPromotedCopy
+                        ? promotionCandidates.some((candidate) =>
+                            candidate.permission === "write"
+                          )
+                          ? "write" as Permission
+                          : "read" as Permission
+                        : item.access.find((entry) =>
+                          entry.userId === persona.id
+                        )?.permission ?? "read",
                     }];
                   })
               )}
@@ -960,7 +1427,7 @@ function App() {
       </main>
 
       <footer>
-        <span>RELAY / PROTOTYPE 0.1</span>
+        <span>DATA MOTION / PROTOTYPE 0.1</span>
         <span>
           <LockKeyhole size={13} /> Data stays in this browser
         </span>
@@ -980,12 +1447,36 @@ function App() {
           personas={personas}
           viewingUser={accessModal.viewingUser}
           onClose={() => setModal(null)}
+          onResolveSyncConflict={(resolution) =>
+            accessModal.viewingUser &&
+            resolveSyncConflict(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              accessModal.viewingUser.id,
+              resolution,
+            )}
+          onReconcilePromotion={(stateId) =>
+            accessModal.viewingUser &&
+            reconcilePromotionState(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              accessModal.viewingUser.id,
+              stateId,
+            )}
           onResolveApproval={(requestId, approved) =>
             resolveApproval(
               accessModal.user!.id,
               accessModal.item!.id,
               requestId,
               approved,
+            )}
+          onUpdateCopy={(patch) =>
+            accessModal.viewingUser &&
+            updatePromotedCopy(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              accessModal.viewingUser.id,
+              patch,
             )}
           onUpdate={(patch) =>
             updateItem(accessModal.user!.id, accessModal.item!.id, patch)}
@@ -1017,6 +1508,9 @@ function BrowserWindow({
     copyType: "promoted" | "demoted";
     copyOutOfSync: boolean;
     differences: string[];
+    promotionConflict: boolean;
+    promotionCandidates: PromotionCandidate[];
+    permission: Permission;
   }[];
   isLinking: boolean;
   linkingSource?: string;
@@ -1060,6 +1554,9 @@ function BrowserWindow({
       copyType: null,
       copyOutOfSync: false,
       differences: [],
+      promotionConflict: false,
+      promotionCandidates: [],
+      permission: "owner" as Permission,
     })),
     ...sharedItems.map(
       ({
@@ -1070,18 +1567,22 @@ function BrowserWindow({
         copyType,
         copyOutOfSync,
         differences,
+        promotionConflict,
+        promotionCandidates,
+        permission,
       }) => ({
         item,
         isOffNetwork: true,
-        canWrite: item.access.some((entry) =>
-          entry.userId === persona.id && entry.permission === "write"
-        ),
+        canWrite: permission === "write",
         ownerId,
         ownerName,
         origin,
         copyType,
         copyOutOfSync,
         differences,
+        promotionConflict,
+        promotionCandidates,
+        permission,
       }),
     ),
   ];
@@ -1173,7 +1674,7 @@ function BrowserWindow({
         </div>
         <div className="address-bar">
           <ShieldCheck size={12} />{" "}
-          relay.local/{persona.name.toLowerCase().replace(" ", "-")}
+          data-motion.local/{persona.name.toLowerCase().replace(" ", "-")}
         </div>
         <button className="chrome-more" aria-label="More options">
           <MoreHorizontal size={16} />
@@ -1283,6 +1784,8 @@ function BrowserWindow({
             copyType,
             copyOutOfSync,
             differences,
+            promotionConflict,
+            promotionCandidates,
           },
         ) => (
           <div
@@ -1294,7 +1797,9 @@ function BrowserWindow({
                 linkingSource === item.id ? "is-source" : ""
               } ${isOffNetwork ? "is-provenance" : ""}`}
               onClick={() => openItem(item.id, ownerId, canWrite)}
-              title={isOffNetwork
+              title={!canWrite
+                ? READ_ONLY_REASON
+                : isOffNetwork
                 ? copyType === "demoted"
                   ? `Synced copy approved for release · Owned by ${ownerName}`
                   : `Synced copy promoted from ${origin} · Owned by ${ownerName}`
@@ -1311,7 +1816,8 @@ function BrowserWindow({
                 : <span className="branch-glyph">└</span>}
               <span>{item.name}</span>
               {(isOffNetwork || (item.pendingApprovals?.length ?? 0) > 0 ||
-                item.demotionOutOfSync || copyOutOfSync) && (
+                item.demotionOutOfSync || copyOutOfSync ||
+                promotionConflict) && (
                 <div className="row-statuses">
                   {isOffNetwork && (
                     <small
@@ -1345,10 +1851,25 @@ function BrowserWindow({
                       <TriangleAlert size={10} />
                     </span>
                   )}
+                  {promotionConflict && (
+                    <span
+                      className="promotion-conflict-icon"
+                      title={`Conflicting promotion states from ${
+                        promotionCandidates.map((candidate) =>
+                          candidate.network
+                        ).join(" and ")
+                      }`}
+                    >
+                      <TriangleAlert size={10} />
+                    </span>
+                  )}
                 </div>
               )}
             </button>
-            <div className="track">
+            <div
+              className="track"
+              title={!canWrite ? READ_ONLY_REASON : undefined}
+            >
               <button
                 className={`gantt-bar ${item.depth === 0 ? "parent" : ""} ${
                   canWrite ? "is-draggable" : "is-readonly"
@@ -1374,6 +1895,7 @@ function BrowserWindow({
                 onDrag={(event) => applyDragPosition(event.clientX)}
                 onDragEnd={markDragComplete}
                 onClick={() => openItem(item.id, ownerId, canWrite)}
+                title={canWrite ? "Drag to reschedule" : READ_ONLY_REASON}
                 aria-label={isOffNetwork
                   ? copyType === "demoted"
                     ? `${item.name}, synced copy approved for release`
@@ -1383,15 +1905,14 @@ function BrowserWindow({
                 {item.depth < 2 && <span>{Math.round(item.duration / 4)}w
                 </span>}
               </button>
-              {canWrite && (
-                <button
-                  className="link-button"
-                  onClick={() => onStartLink(item.id)}
-                  title="Draw dependency"
-                >
-                  <Link2 size={11} />
-                </button>
-              )}
+              <button
+                className={`link-button ${!canWrite ? "is-disabled" : ""}`}
+                disabled={!canWrite}
+                onClick={() => onStartLink(item.id)}
+                title={canWrite ? "Draw dependency" : READ_ONLY_REASON}
+              >
+                <Link2 size={11} />
+              </button>
             </div>
           </div>
         ))}
@@ -1521,6 +2042,9 @@ function AccessModal({
   viewingUser,
   onClose,
   onResolveApproval,
+  onResolveSyncConflict,
+  onReconcilePromotion,
+  onUpdateCopy,
   onUpdate,
 }: {
   owner: Persona;
@@ -1529,10 +2053,14 @@ function AccessModal({
   viewingUser?: Persona;
   onClose: () => void;
   onResolveApproval: (requestId: string, approved: boolean) => void;
+  onResolveSyncConflict: (resolution: "source" | "local") => void;
+  onReconcilePromotion: (stateId: string | "local") => void;
+  onUpdateCopy: (patch: Partial<PromotedCopySnapshot>) => void;
   onUpdate: (patch: Partial<ScheduleItem>) => void;
 }) {
   const [showSyncChanges, setShowSyncChanges] = useState(false);
-  const others = personas.filter((persona) => persona.id !== owner.id);
+  const [showPeoplePicker, setShowPeoplePicker] = useState(false);
+  const [selectedPeople, setSelectedPeople] = useState<string[]>([]);
   const originLevel = NETWORKS.indexOf(owner.network);
   const isReleasedCopy = Boolean(
     viewingUser &&
@@ -1540,14 +2068,50 @@ function AccessModal({
       item.destination === viewingUser.network &&
       (item.demotion || item.demotedSnapshot),
   );
+  const promotionCandidates = viewingUser && !isReleasedCopy
+    ? getPromotionCandidates(item, owner, viewingUser, personas)
+    : [];
   const promotedCopy = viewingUser && !isReleasedCopy
     ? item.promotedCopies?.[viewingUser.id]
     : undefined;
+  const hasPromotionStateConflict = promotionCandidates.length > 1 &&
+    promotedCopy?.reconciledCandidateSignature !==
+      promotionCandidateSignature(promotionCandidates);
+  const isPromotedCopyView = Boolean(
+    viewingUser && !isReleasedCopy && promotionCandidates.length > 0,
+  );
+  const viewerPermission = viewingUser
+    ? isPromotedCopyView
+      ? promotionCandidates.some((candidate) =>
+          candidate.permission === "write"
+        )
+        ? "write"
+        : "read"
+      : item.access.find((entry) => entry.userId === viewingUser.id)
+        ?.permission ??
+        "none"
+    : "owner";
+  const isReadOnly = Boolean(
+    viewingUser && viewerPermission !== "write",
+  );
+  const canManagePromotion = !viewingUser ||
+    (isPromotedCopyView && !isReadOnly);
+  const accessOwner = isPromotedCopyView && viewingUser ? viewingUser : owner;
+  const activeAccess = isPromotedCopyView
+    ? promotedCopy?.access ?? []
+    : item.access;
+  const others = personas.filter((persona) => persona.id !== accessOwner.id);
+  const hasSourceConflict = Boolean(
+    promotedCopy?.differences.includes(
+      "Source schedule changed after the local edit",
+    ),
+  );
   const displayedSyncTime = isReleasedCopy
     ? item.demotedSnapshot?.lastSyncedAt ?? item.lastSyncedAt
     : promotedCopy?.lastSyncedAt ?? item.lastSyncedAt;
   const visibleApprovals = (item.pendingApprovals ?? []).filter((request) =>
-    !viewingUser || request.editorUserId === viewingUser.id
+    !isHighSideOnlyRequest(request, item, owner, personas) &&
+    (!viewingUser || request.editorUserId === viewingUser.id)
   );
   const destinations = NETWORKS.filter((_, index) => index < originLevel);
   const allItems = personas.flatMap((persona) => persona.items);
@@ -1561,18 +2125,83 @@ function AccessModal({
       ),
     }))
     .filter((connection) => connection.other);
+  const grantedPeople = others.filter((persona) => {
+    const permission = activeAccess.find((entry) => entry.userId === persona.id)
+      ?.permission;
+    return permission === "read" || permission === "write";
+  });
+  const availablePeople = others.filter((persona) =>
+    !grantedPeople.some((granted) => granted.id === persona.id)
+  );
 
-  function setAccess(userId: string, permission: Permission) {
-    onUpdate({
-      access: [...item.access.filter((entry) => entry.userId !== userId), {
-        userId,
-        permission,
-      }],
+  function updateLocalCopy(patch: Partial<PromotedCopySnapshot>) {
+    const inherited = promotionCandidates[0];
+    onUpdateCopy({
+      start: promotedCopy?.start ?? inherited?.start ?? item.start,
+      duration: promotedCopy?.duration ?? inherited?.duration ?? item.duration,
+      lastSyncedAt: promotedCopy?.lastSyncedAt ??
+        inherited?.lastSyncedAt ??
+        item.lastSyncedAt ??
+        new Date().toISOString(),
+      promotedFromUserId: promotedCopy?.promotedFromUserId ??
+        inherited?.holderUserId,
+      ...patch,
     });
   }
 
+  function setAccess(userId: string, permission: Permission) {
+    if (isReadOnly) return;
+    const access = [
+      ...activeAccess.filter((entry) => entry.userId !== userId),
+      {
+        userId,
+        permission,
+      },
+    ];
+    if (isPromotedCopyView) {
+      updateLocalCopy({ access });
+    } else {
+      onUpdate({ access });
+    }
+  }
+
+  function toggleSelectedPerson(userId: string) {
+    setSelectedPeople((current) =>
+      current.includes(userId)
+        ? current.filter((id) => id !== userId)
+        : [...current, userId]
+    );
+  }
+
+  function addSelectedPeople() {
+    if (isReadOnly || selectedPeople.length === 0) return;
+    const access = [
+      ...activeAccess.filter((entry) => !selectedPeople.includes(entry.userId)),
+      ...selectedPeople.map((userId) => ({
+        userId,
+        permission: "read" as Permission,
+      })),
+    ];
+    if (isPromotedCopyView) {
+      updateLocalCopy({ access });
+    } else {
+      onUpdate({
+        access,
+      });
+    }
+    setSelectedPeople([]);
+    setShowPeoplePicker(false);
+  }
+
   function setMovement(kind: "promotion" | "demotion", enabled: boolean) {
+    if (isReadOnly) return;
+    if (kind === "promotion" && viewingUser && !isPromotedCopyView) return;
+    if (kind === "demotion" && viewingUser) return;
     if (kind === "demotion" && !item.approvals && enabled) return;
+    if (kind === "promotion" && isPromotedCopyView) {
+      updateLocalCopy({ promotion: enabled });
+      return;
+    }
     const valid = NETWORKS.filter((_, index) =>
       kind === "promotion" ? index > originLevel : index < originLevel
     );
@@ -1596,6 +2225,18 @@ function AccessModal({
       onClose={onClose}
     >
       <div className="modal-body access-body">
+        {isReadOnly && (
+          <div className="read-only-banner" title={READ_ONLY_REASON}>
+            <LockKeyhole size={16} />
+            <div>
+              <strong>View-only access</strong>
+              <span>
+                You can inspect this object, but editing, sharing, approvals,
+                and dependencies are locked.
+              </span>
+            </div>
+          </div>
+        )}
         {viewingUser && (
           <>
             <div className="provenance-banner">
@@ -1643,20 +2284,87 @@ function AccessModal({
             )}
           </>
         )}
+        {isPromotedCopyView && hasPromotionStateConflict && (
+          <div className="promotion-state-conflict">
+            <div className="promotion-conflict-heading">
+              <TriangleAlert size={17} />
+              <div>
+                <strong>Conflicting promotion states</strong>
+                <span>
+                  This copy receives updates through multiple promotion paths.
+                  Choose a state to reconcile, or keep an independent state on
+                  this network.
+                </span>
+              </div>
+            </div>
+            <div className="promotion-state-list">
+              {promotionCandidates.map((candidate) => (
+                <div className="promotion-state-option" key={candidate.stateId}>
+                  <div>
+                    <strong>{candidate.network} state</strong>
+                    <span>
+                      {candidate.holderName} · Last synced{" "}
+                      {formatSyncTime(candidate.lastSyncedAt)}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() =>
+                      onReconcilePromotion(candidate.stateId)}
+                  >
+                    Use this state
+                  </button>
+                </div>
+              ))}
+            </div>
+            <button
+              className="create-local-state"
+              onClick={() => onReconcilePromotion("local")}
+            >
+              Keep or create my own state
+            </button>
+          </div>
+        )}
         {promotedCopy?.outOfSync && (
           <div className="out-of-sync-banner copy-divergence">
             <TriangleAlert size={17} />
             <div>
-              <strong>This synced copy is out of sync</strong>
+              <strong>
+                {hasSourceConflict
+                  ? "The low-side source changed"
+                  : "This synced copy is out of sync"}
+              </strong>
               <span>
-                Your higher-network edit remains local because demotion is off.
-                Nothing was sent to lower networks.
+                {hasSourceConflict
+                  ? "The source changed after your local edit. Choose which version to keep on this network."
+                  : "Your higher-network edit remains local because demotion is off. Nothing was sent to lower networks."}
               </span>
               <ul>
                 {promotedCopy.differences.map((difference) => (
                   <li key={difference}>{difference}</li>
                 ))}
               </ul>
+              {hasSourceConflict && (
+                <div
+                  className="conflict-actions"
+                  title={isReadOnly ? READ_ONLY_REASON : undefined}
+                >
+                  <button
+                    disabled={isReadOnly}
+                    title={isReadOnly ? READ_ONLY_REASON : undefined}
+                    onClick={() => onResolveSyncConflict("source")}
+                  >
+                    <RefreshCw size={11} /> Use low-side version
+                  </button>
+                  <button
+                    className="keep-local"
+                    disabled={isReadOnly}
+                    title={isReadOnly ? READ_ONLY_REASON : undefined}
+                    onClick={() => onResolveSyncConflict("local")}
+                  >
+                    <Check size={11} /> Keep high-side changes
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1750,7 +2458,10 @@ function AccessModal({
             </div>
           </section>
         )}
-        <section className="control-section">
+        <section
+          className={`control-section ${isReadOnly ? "permission-locked" : ""}`}
+          title={isReadOnly ? READ_ONLY_REASON : undefined}
+        >
           <div className="section-heading">
             <div>
               <Users size={17} />
@@ -1759,22 +2470,95 @@ function AccessModal({
                 <span>Choose who can see or change this object.</span>
               </div>
             </div>
+            <button
+              className="add-people-button"
+              disabled={isReadOnly || availablePeople.length === 0}
+              title={isReadOnly
+                ? READ_ONLY_REASON
+                : availablePeople.length === 0
+                ? "All available users have been added."
+                : "Add collaborators"}
+              onClick={() => setShowPeoplePicker((current) => !current)}
+            >
+              <Plus size={12} /> Add people <ChevronDown size={11} />
+            </button>
           </div>
+          {showPeoplePicker && !isReadOnly && (
+            <div className="people-picker">
+              <div className="people-picker-heading">
+                <strong>Select collaborators</strong>
+                <span>{selectedPeople.length} selected</span>
+              </div>
+              <div className="people-picker-list">
+                {availablePeople.map((persona) => (
+                  <label className="people-picker-option" key={persona.id}>
+                    <input
+                      type="checkbox"
+                      checked={selectedPeople.includes(persona.id)}
+                      onChange={() =>
+                        toggleSelectedPerson(persona.id)}
+                    />
+                    <div
+                      className="mini-avatar"
+                      style={{ background: persona.accent }}
+                    >
+                      {persona.name[0]}
+                    </div>
+                    <div className="access-person">
+                      <strong>
+                        {persona.name}
+                        {viewingUser?.id === persona.id ? " (you)" : ""}
+                      </strong>
+                      <span>{persona.organization} · {persona.network}</span>
+                    </div>
+                    {selectedPeople.includes(persona.id) && <Check size={13} />}
+                  </label>
+                ))}
+              </div>
+              <div className="people-picker-footer">
+                <button onClick={() => setShowPeoplePicker(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="add-selected"
+                  disabled={selectedPeople.length === 0}
+                  onClick={addSelectedPeople}
+                >
+                  Add selected
+                </button>
+              </div>
+            </div>
+          )}
           <div className="access-list">
             <div className="access-row owner-row">
-              <div className="mini-avatar" style={{ background: owner.accent }}>
-                {owner.name[0]}
+              <div
+                className="mini-avatar"
+                style={{ background: accessOwner.accent }}
+              >
+                {accessOwner.name[0]}
               </div>
               <div className="access-person">
-                <strong>{owner.name}</strong>
-                <span>{owner.organization}</span>
+                <strong>
+                  {accessOwner.name}
+                  {(!viewingUser || viewingUser.id === accessOwner.id)
+                    ? " (you)"
+                    : ""}
+                </strong>
+                <span>{accessOwner.organization}</span>
               </div>
-              <span className="owner-chip">Owner</span>
+              <span className="owner-chip">
+                {isPromotedCopyView ? "Copy owner" : "Owner"}
+              </span>
             </div>
-            {others.map((persona) => {
-              const permission = item.access.find((entry) =>
+            {grantedPeople.length === 0 && (
+              <span className="empty-collaborators">
+                No collaborators added yet.
+              </span>
+            )}
+            {grantedPeople.map((persona) => {
+              const permission = activeAccess.find((entry) =>
                 entry.userId === persona.id
-              )?.permission ?? "none";
+              )?.permission ?? "read";
               return (
                 <div className="access-row" key={persona.id}>
                   <div
@@ -1784,17 +2568,22 @@ function AccessModal({
                     {persona.name[0]}
                   </div>
                   <div className="access-person">
-                    <strong>{persona.name}</strong>
+                    <strong>
+                      {persona.name}
+                      {viewingUser?.id === persona.id ? " (you)" : ""}
+                    </strong>
                     <span>{persona.organization} · {persona.network}</span>
                   </div>
                   <select
+                    disabled={isReadOnly}
+                    title={isReadOnly ? READ_ONLY_REASON : undefined}
                     value={permission}
                     onChange={(event) =>
                       setAccess(persona.id, event.target.value as Permission)}
                   >
-                    <option value="none">No access</option>
-                    <option value="read">Can read</option>
-                    <option value="write">Can write</option>
+                    <option value="none">Remove access</option>
+                    <option value="read">Viewer</option>
+                    <option value="write">Editor</option>
                   </select>
                 </div>
               );
@@ -1802,7 +2591,14 @@ function AccessModal({
           </div>
         </section>
 
-        <section className="control-section dependency-section">
+        <section
+          className={`control-section dependency-section ${
+            isReadOnly ? "permission-locked" : ""
+          }`}
+          title={isReadOnly
+            ? "View-only access: dependencies can be inspected but not created or changed."
+            : undefined}
+        >
           <div className="section-heading">
             <div>
               <GitBranch size={17} />
@@ -1841,7 +2637,14 @@ function AccessModal({
           </div>
         </section>
 
-        <section className="control-section policy">
+        <section
+          className={`control-section policy ${
+            viewingUser ? "permission-locked" : ""
+          }`}
+          title={viewingUser
+            ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_APPROVAL_REASON
+            : undefined}
+        >
           <div className="section-heading">
             <div>
               <ShieldCheck size={17} />
@@ -1854,8 +2657,13 @@ function AccessModal({
             </div>
             <Toggle
               label="Owner approvals"
+              disabled={Boolean(viewingUser)}
+              disabledReason={isReadOnly
+                ? READ_ONLY_REASON
+                : OWNER_ONLY_APPROVAL_REASON}
               checked={item.approvals}
               onChange={(approvals) =>
+                !viewingUser &&
                 onUpdate({
                   approvals,
                   promotion: item.promotion,
@@ -1865,7 +2673,14 @@ function AccessModal({
           </div>
         </section>
 
-        <section className="control-section policy">
+        <section
+          className={`control-section policy ${
+            !canManagePromotion ? "permission-locked" : ""
+          }`}
+          title={!canManagePromotion
+            ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_PROMOTION_REASON
+            : undefined}
+        >
           <div className="section-heading">
             <div>
               <ArrowUpToLine size={17} />
@@ -1876,8 +2691,14 @@ function AccessModal({
             </div>
             <Toggle
               label="Promotion"
-              disabled={originLevel === 4}
-              checked={item.promotion}
+              disabled={!canManagePromotion ||
+                NETWORKS.indexOf(accessOwner.network) === 4}
+              disabledReason={!canManagePromotion
+                ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_PROMOTION_REASON
+                : undefined}
+              checked={isPromotedCopyView
+                ? promotedCopy?.promotion ?? false
+                : item.promotion}
               onChange={(next) => setMovement("promotion", next)}
             />
           </div>
@@ -1885,8 +2706,11 @@ function AccessModal({
 
         <section
           className={`control-section policy ${
-            !item.approvals ? "disabled-section" : ""
+            !item.approvals || viewingUser ? "disabled-section" : ""
           }`}
+          title={viewingUser
+            ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_DEMOTION_REASON
+            : undefined}
         >
           <div className="section-heading">
             <div>
@@ -1898,7 +2722,11 @@ function AccessModal({
             </div>
             <Toggle
               label="Demotion"
-              disabled={!item.approvals || originLevel === 0}
+              disabled={Boolean(viewingUser) || !item.approvals ||
+                originLevel === 0}
+              disabledReason={viewingUser
+                ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_DEMOTION_REASON
+                : undefined}
               checked={item.demotion}
               onChange={(next) => setMovement("demotion", next)}
             />
@@ -1906,9 +2734,15 @@ function AccessModal({
         </section>
 
         {item.demotion && (
-          <label className="field destination-field">
+          <label
+            className={`field destination-field ${
+              isReadOnly ? "permission-locked" : ""
+            }`}
+            title={isReadOnly ? READ_ONLY_REASON : undefined}
+          >
             <span>Destination network</span>
             <select
+              disabled={isReadOnly}
               value={item.destination}
               onChange={(event) =>
                 onUpdate({ destination: event.target.value as Network })}
@@ -1931,10 +2765,20 @@ function AccessModal({
       </div>
       <div className="modal-footer">
         <span>
-          <Save size={14} /> Changes save automatically
+          {isReadOnly
+            ? (
+              <>
+                <LockKeyhole size={14} /> View-only access
+              </>
+            )
+            : (
+              <>
+                <Save size={14} /> Changes save automatically
+              </>
+            )}
         </span>
         <button className="primary-button" onClick={onClose}>
-          <Check size={16} /> Apply controls
+          <Check size={16} /> {isReadOnly ? "Done" : "Apply controls"}
         </button>
       </div>
     </ModalShell>

@@ -1,4 +1,4 @@
-# Relay Sandbox
+# Data Motion
 
 A multi-user visualization sandbox for exploring schedule synchronization,
 cross-network sharing, permissions, dependencies, and approval workflows.
