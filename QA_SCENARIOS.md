@@ -95,6 +95,9 @@ Expected:
 
 - The picker lists users who have not already been added.
 - Multiple users can be selected before confirming.
+- **Add selected** shows the staged count.
+- Choosing **Apply controls** also commits any staged collaborators, preventing
+  selected users from being silently discarded.
 - Added users appear in the access list with **Viewer** permission.
 - Each listed collaborator can then be changed to **Editor** or removed.
 - Removed users return to the available-user picker.
@@ -142,6 +145,9 @@ Expected:
 - The copy disappears from the receiving browser.
 - Other recipients remain unaffected.
 - No stale approval or dependency control remains available to the revoked user.
+- For multi-hop sharing, the revoked lower-network owner and their role pill
+  disappear from the receiving share modal.
+- If another valid promotion path remains, only that path's owners stay visible.
 
 ## Promotion
 
@@ -231,6 +237,11 @@ Expected:
 
 - The SIPR access list and promotion controls belong to the SIPR copy state, not
   the NIPR origin.
+- The collaborator list shows a **Source Owner** pill beside the origin user and
+  a network-owner pill beside each intermediary, for example, **NIPR owner**
+  beside Eli.
+- Lower-network lineage owners remain visible without being duplicated in the
+  add-people picker.
 - The JWICS user receives the SIPR dates, including its out-of-sync state.
 - The JWICS copy identifies SIPR as its immediate promotion source.
 - The NIPR origin remains unchanged and unaware of the SIPR edit.
@@ -241,8 +252,11 @@ Continue from QA-PROMO-07 and move the SIPR copy again.
 
 Expected:
 
-- The JWICS copy updates to the new SIPR dates.
-- It remains marked as inherited from an out-of-sync promoted state.
+- Because the JWICS copy is already out of sync, its Gantt bar does not move
+  automatically.
+- Its modal lists the newly updated SIPR state as an available lower-network
+  version.
+- The SIPR row includes a **Sync to this state** action.
 - No approval request or alert appears on NIPR.
 
 ### QA-PROMO-09 — Conflicting direct and inherited promotion states
@@ -255,7 +269,9 @@ Expected:
 
 - The JWICS row shows a conflicting-promotion-state alert.
 - The modal lists both NIPR origin and SIPR synced-state candidates.
-- Each candidate shows its source, network, and last-synced time.
+- Each candidate shows its source, network, schedule state, and last-synced
+  time.
+- Each candidate has a **Sync to this state** action.
 - No candidate is silently allowed to overwrite the other.
 
 ### QA-PROMO-10 — Reconcile promotion states
@@ -275,6 +291,20 @@ Expected:
   changes later.
 - A locally edited JWICS state follows normal out-of-sync and network-boundary
   rules.
+
+### QA-PROMO-11 — Lower state changes while higher copy is out of sync
+
+1. Diverge a JWICS copy from its NIPR or SIPR source.
+2. Record the JWICS bar position.
+3. Move the lower-network source.
+
+Expected:
+
+- The JWICS bar remains at its divergent position.
+- The lower-network version shown in the JWICS modal updates to the new dates.
+- The modal lists every different lower-network state and provides a sync button
+  for each.
+- Selecting a state updates JWICS only after explicit confirmation.
 
 ## Demotion
 
@@ -340,6 +370,8 @@ Expected:
 - No date, dependency, timestamp, alert, or approval travels downward.
 - The higher-network source shows that the lower copy is out of sync.
 - The higher-side modal explains that demotion is off.
+- The modal lists the retained lower-network version with a **Sync to this
+  state** action.
 - The lower-side UI says nothing about the higher-side change.
 
 ### QA-DEMOTE-06 — Re-enable demotion

@@ -1011,6 +1011,20 @@ footer span {
 .promotion-state-list {
   border-block: 1px solid #44384e;
 }
+.promotion-state-list.embedded {
+  margin-top: 7px;
+  border: 1px solid #543f42;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.version-list-title {
+  display: block;
+  margin-top: 11px;
+  color: #ddaaa6;
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
 .promotion-state-option {
   display: flex;
   align-items: center;
@@ -1040,6 +1054,10 @@ footer span {
   color: #deb8f2;
   font-size: 8px;
   cursor: pointer;
+}
+.promotion-state-option button:disabled, .create-local-state:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 .create-local-state {
   margin: 9px 13px;
@@ -1346,6 +1364,20 @@ footer span {
 .owner-chip {
   color: var(--lime);
   font: 8px "DM Mono";
+  text-transform: uppercase;
+}
+.lineage-owner-row {
+  background: #1c2420;
+}
+.lineage-chip {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border: 1px solid #40594c;
+  border-radius: 99px;
+  padding: 4px 7px;
+  color: #96c7a8;
+  background: #223029;
+  font: 7px "DM Mono";
   text-transform: uppercase;
 }
 .count-chip {

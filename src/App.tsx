@@ -774,7 +774,8 @@ function App() {
             Object.entries(promotedCopies).forEach(([holderId, copy]) => {
               if (
                 holderId === editorUserId ||
-                copy.promotedFromUserId !== editorUserId
+                copy.promotedFromUserId !== editorUserId ||
+                copy.outOfSync
               ) {
                 return;
               }
@@ -1019,6 +1020,36 @@ function App() {
                       ),
                     },
                   },
+                }
+                : entry
+            ),
+          }
+          : persona
+      );
+    });
+  }
+
+  function syncToDemotedState(ownerId: string, itemId: string) {
+    setPersonas((current) => {
+      const item = current
+        .find((persona) => persona.id === ownerId)
+        ?.items.find((entry) => entry.id === itemId);
+      if (!item?.demotedSnapshot) return current;
+      const shifted = shiftConnectedItems(
+        current,
+        itemId,
+        item.demotedSnapshot.start - item.start,
+      );
+      return shifted.map((persona) =>
+        persona.id === ownerId
+          ? {
+            ...persona,
+            items: persona.items.map((entry) =>
+              entry.id === itemId
+                ? {
+                  ...entry,
+                  demotionOutOfSync: false,
+                  lastSyncedAt: item.demotedSnapshot!.lastSyncedAt,
                 }
                 : entry
             ),
@@ -1462,6 +1493,11 @@ function App() {
               accessModal.item!.id,
               accessModal.viewingUser.id,
               stateId,
+            )}
+          onSyncToDemotedState={() =>
+            syncToDemotedState(
+              accessModal.user!.id,
+              accessModal.item!.id,
             )}
           onResolveApproval={(requestId, approved) =>
             resolveApproval(
@@ -2044,6 +2080,7 @@ function AccessModal({
   onResolveApproval,
   onResolveSyncConflict,
   onReconcilePromotion,
+  onSyncToDemotedState,
   onUpdateCopy,
   onUpdate,
 }: {
@@ -2055,6 +2092,7 @@ function AccessModal({
   onResolveApproval: (requestId: string, approved: boolean) => void;
   onResolveSyncConflict: (resolution: "source" | "local") => void;
   onReconcilePromotion: (stateId: string | "local") => void;
+  onSyncToDemotedState: () => void;
   onUpdateCopy: (patch: Partial<PromotedCopySnapshot>) => void;
   onUpdate: (patch: Partial<ScheduleItem>) => void;
 }) {
@@ -2077,6 +2115,12 @@ function AccessModal({
   const hasPromotionStateConflict = promotionCandidates.length > 1 &&
     promotedCopy?.reconciledCandidateSignature !==
       promotionCandidateSignature(promotionCandidates);
+  const differentLowerStates = promotedCopy
+    ? promotionCandidates.filter((candidate) =>
+      candidate.start !== promotedCopy.start ||
+      candidate.duration !== promotedCopy.duration
+    )
+    : [];
   const isPromotedCopyView = Boolean(
     viewingUser && !isReleasedCopy && promotionCandidates.length > 0,
   );
@@ -2101,6 +2145,31 @@ function AccessModal({
     ? promotedCopy?.access ?? []
     : item.access;
   const others = personas.filter((persona) => persona.id !== accessOwner.id);
+  const lowerNetworkOwners = (() => {
+    if (!isPromotedCopyView) return [];
+    const entries: { persona: Persona; label: string }[] = [];
+    const addEntry = (persona: Persona, label: string) => {
+      if (
+        persona.id === accessOwner.id ||
+        NETWORKS.indexOf(persona.network) >=
+          NETWORKS.indexOf(accessOwner.network) ||
+        entries.some((entry) => entry.persona.id === persona.id)
+      ) {
+        return;
+      }
+      entries.push({ persona, label });
+    };
+    addEntry(owner, "Source Owner");
+    promotionCandidates.forEach((candidate) => {
+      const holder = personas.find((persona) =>
+        persona.id === candidate.holderUserId
+      );
+      if (holder && holder.id !== owner.id) {
+        addEntry(holder, `${holder.network} owner`);
+      }
+    });
+    return entries;
+  })();
   const hasSourceConflict = Boolean(
     promotedCopy?.differences.includes(
       "Source schedule changed after the local edit",
@@ -2126,12 +2195,18 @@ function AccessModal({
     }))
     .filter((connection) => connection.other);
   const grantedPeople = others.filter((persona) => {
+    if (
+      lowerNetworkOwners.some((entry) => entry.persona.id === persona.id)
+    ) {
+      return false;
+    }
     const permission = activeAccess.find((entry) => entry.userId === persona.id)
       ?.permission;
     return permission === "read" || permission === "write";
   });
   const availablePeople = others.filter((persona) =>
-    !grantedPeople.some((granted) => granted.id === persona.id)
+    !grantedPeople.some((granted) => granted.id === persona.id) &&
+    !lowerNetworkOwners.some((entry) => entry.persona.id === persona.id)
   );
 
   function updateLocalCopy(patch: Partial<PromotedCopySnapshot>) {
@@ -2191,6 +2266,13 @@ function AccessModal({
     }
     setSelectedPeople([]);
     setShowPeoplePicker(false);
+  }
+
+  function applyControlsAndClose() {
+    if (selectedPeople.length > 0) {
+      addSelectedPeople();
+    }
+    onClose();
   }
 
   function setMovement(kind: "promotion" | "demotion", enabled: boolean) {
@@ -2284,7 +2366,8 @@ function AccessModal({
             )}
           </>
         )}
-        {isPromotedCopyView && hasPromotionStateConflict && (
+        {isPromotedCopyView && hasPromotionStateConflict &&
+          !promotedCopy?.outOfSync && (
           <div className="promotion-state-conflict">
             <div className="promotion-conflict-heading">
               <TriangleAlert size={17} />
@@ -2304,20 +2387,26 @@ function AccessModal({
                     <strong>{candidate.network} state</strong>
                     <span>
                       {candidate.holderName} · Last synced{" "}
-                      {formatSyncTime(candidate.lastSyncedAt)}
+                      {formatSyncTime(candidate.lastSyncedAt)} · Starts at{" "}
+                      {Math.round(candidate.start)}% ·{" "}
+                      {Math.round(candidate.duration / 4)}w
                     </span>
                   </div>
                   <button
+                    disabled={isReadOnly}
+                    title={isReadOnly ? READ_ONLY_REASON : undefined}
                     onClick={() =>
                       onReconcilePromotion(candidate.stateId)}
                   >
-                    Use this state
+                    Sync to this state
                   </button>
                 </div>
               ))}
             </div>
             <button
               className="create-local-state"
+              disabled={isReadOnly}
+              title={isReadOnly ? READ_ONLY_REASON : undefined}
               onClick={() => onReconcilePromotion("local")}
             >
               Keep or create my own state
@@ -2343,28 +2432,52 @@ function AccessModal({
                   <li key={difference}>{difference}</li>
                 ))}
               </ul>
-              {hasSourceConflict && (
-                <div
-                  className="conflict-actions"
-                  title={isReadOnly ? READ_ONLY_REASON : undefined}
-                >
-                  <button
-                    disabled={isReadOnly}
-                    title={isReadOnly ? READ_ONLY_REASON : undefined}
-                    onClick={() => onResolveSyncConflict("source")}
-                  >
-                    <RefreshCw size={11} /> Use low-side version
-                  </button>
-                  <button
-                    className="keep-local"
-                    disabled={isReadOnly}
-                    title={isReadOnly ? READ_ONLY_REASON : undefined}
-                    onClick={() => onResolveSyncConflict("local")}
-                  >
-                    <Check size={11} /> Keep high-side changes
-                  </button>
-                </div>
+              {differentLowerStates.length > 0 && (
+                <>
+                  <strong className="version-list-title">
+                    Available lower-network versions
+                  </strong>
+                  <div className="promotion-state-list embedded">
+                    {differentLowerStates.map((candidate) => (
+                      <div
+                        className="promotion-state-option"
+                        key={candidate.stateId}
+                      >
+                        <div>
+                          <strong>{candidate.network} state</strong>
+                          <span>
+                            {candidate.holderName} · Starts at{" "}
+                            {Math.round(candidate.start)}% ·{" "}
+                            {Math.round(candidate.duration / 4)}w · Updated{" "}
+                            {formatSyncTime(candidate.lastSyncedAt)}
+                          </span>
+                        </div>
+                        <button
+                          disabled={isReadOnly}
+                          title={isReadOnly ? READ_ONLY_REASON : undefined}
+                          onClick={() =>
+                            onReconcilePromotion(candidate.stateId)}
+                        >
+                          Sync to this state
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </>
               )}
+              <div
+                className="conflict-actions"
+                title={isReadOnly ? READ_ONLY_REASON : undefined}
+              >
+                <button
+                  className="keep-local"
+                  disabled={isReadOnly}
+                  title={isReadOnly ? READ_ONLY_REASON : undefined}
+                  onClick={() => onReconcilePromotion("local")}
+                >
+                  <Check size={11} /> Keep my current state
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -2377,6 +2490,36 @@ function AccessModal({
                 Demotion is off, so recent changes were not released to lower
                 networks. Enable demotion to synchronize the approved copy.
               </span>
+              {item.demotedSnapshot && (
+                <>
+                  <strong className="version-list-title">
+                    Available lower-network version
+                  </strong>
+                  <div className="promotion-state-list embedded">
+                    <div className="promotion-state-option">
+                      <div>
+                        <strong>{item.destination} released state</strong>
+                        <span>
+                          Approved copy · Starts at{" "}
+                          {Math.round(item.demotedSnapshot.start)}% ·{" "}
+                          {Math.round(item.demotedSnapshot.duration / 4)}w ·
+                          Updated{" "}
+                          {formatSyncTime(item.demotedSnapshot.lastSyncedAt)}
+                        </span>
+                      </div>
+                      <button
+                        disabled={Boolean(viewingUser)}
+                        title={viewingUser
+                          ? OWNER_ONLY_DEMOTION_REASON
+                          : undefined}
+                        onClick={onSyncToDemotedState}
+                      >
+                        Sync to this state
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -2524,7 +2667,7 @@ function AccessModal({
                   disabled={selectedPeople.length === 0}
                   onClick={addSelectedPeople}
                 >
-                  Add selected
+                  Add selected ({selectedPeople.length})
                 </button>
               </div>
             </div>
@@ -2547,10 +2690,28 @@ function AccessModal({
                 <span>{accessOwner.organization}</span>
               </div>
               <span className="owner-chip">
-                {isPromotedCopyView ? "Copy owner" : "Owner"}
+                {isPromotedCopyView
+                  ? `${accessOwner.network} copy owner`
+                  : "Source owner"}
               </span>
             </div>
-            {grantedPeople.length === 0 && (
+            {lowerNetworkOwners.map(({ persona, label }) => (
+              <div className="access-row lineage-owner-row" key={persona.id}>
+                <div
+                  className="mini-avatar"
+                  style={{ background: persona.accent }}
+                >
+                  {persona.name[0]}
+                </div>
+                <div className="access-person">
+                  <strong>{persona.name}</strong>
+                  <span>{persona.organization} · {persona.network}</span>
+                </div>
+                <span className="lineage-chip">{label}</span>
+              </div>
+            ))}
+            {grantedPeople.length === 0 &&
+              lowerNetworkOwners.length === 0 && (
               <span className="empty-collaborators">
                 No collaborators added yet.
               </span>
@@ -2777,7 +2938,7 @@ function AccessModal({
               </>
             )}
         </span>
-        <button className="primary-button" onClick={onClose}>
+        <button className="primary-button" onClick={applyControlsAndClose}>
           <Check size={16} /> {isReadOnly ? "Done" : "Apply controls"}
         </button>
       </div>
