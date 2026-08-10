@@ -21,3 +21,15 @@ npm run deploy
 Live site:
 
 https://sloanal.github.io/data-motion/
+
+Behavioral rulebook:
+
+https://sloanal.github.io/data-motion/#rules
+
+Release history:
+
+https://sloanal.github.io/data-motion/#changelog
+
+Detailed behavioral scenarios are maintained in
+[QA_SCENARIOS.md](./QA_SCENARIOS.md). The document is designed to be readable
+directly or loaded into an LLM for scenario-specific questions.

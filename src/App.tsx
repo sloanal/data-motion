@@ -1,13 +1,18 @@
 import {
   ArrowDownToLine,
+  ArrowLeft,
+  ArrowRight,
   ArrowUpToLine,
   BadgeCheck,
+  BookOpen,
   Check,
   ChevronDown,
   ChevronRight,
   Clock3,
   Download,
+  ExternalLink,
   GitBranch,
+  History,
   Info,
   Link2,
   LockKeyhole,
@@ -17,13 +22,16 @@ import {
   RotateCcw,
   Save,
   Settings2,
+  Shield,
   ShieldCheck,
   TriangleAlert,
   Upload,
   Users,
+  Waypoints,
   X,
 } from "lucide-react";
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CHANGELOG } from "./changelog";
 
 const NETWORKS = ["Commercial", "NIPR", "SIPR", "JWICS", "SAP"] as const;
 const READ_ONLY_REASON =
@@ -59,6 +67,7 @@ type DemotedSnapshot = {
 };
 
 type PromotedCopySnapshot = DemotedSnapshot & {
+  copyKind?: "promoted" | "demoted";
   outOfSync: boolean;
   differences: string[];
   lastLocalEditAt?: string;
@@ -67,6 +76,12 @@ type PromotedCopySnapshot = DemotedSnapshot & {
   promotion?: boolean;
   promotedFromUserId?: string;
   reconciledCandidateSignature?: string;
+};
+
+type DistributionPolicy = {
+  promotion: boolean;
+  demotion: boolean;
+  destination: Network;
 };
 
 type PromotionCandidate = {
@@ -82,7 +97,7 @@ type PromotionCandidate = {
   differences: string[];
 };
 
-type ScheduleItem = {
+type ScheduleItem = DistributionPolicy & {
   id: string;
   name: string;
   start: number;
@@ -90,9 +105,6 @@ type ScheduleItem = {
   depth: number;
   color: string;
   approvals: boolean;
-  promotion: boolean;
-  demotion: boolean;
-  destination: Network;
   access: Access[];
   lastSyncedAt?: string;
   pendingApprovals?: ApprovalRequest[];
@@ -121,6 +133,8 @@ type Modal =
     viewingUserId?: string;
   }
   | null;
+
+type AppView = "sandbox" | "rules" | "changelog";
 
 const COLORS = [
   "#d6ff63",
@@ -354,6 +368,62 @@ function promotionCandidateSignature(candidates: PromotionCandidate[]) {
     .join("|");
 }
 
+function promotionCandidatesConflict(candidates: PromotionCandidate[]) {
+  return new Set(
+    candidates.map((candidate) => `${candidate.start}:${candidate.duration}`),
+  ).size > 1;
+}
+
+function promotedCopyDiffersFromSources(
+  copy: PromotedCopySnapshot,
+  candidates: PromotionCandidate[],
+) {
+  return candidates.some((candidate) =>
+    candidate.start !== copy.start || candidate.duration !== copy.duration
+  ) ||
+    copy.differences.some((difference) =>
+      difference.toLowerCase().includes("dependency")
+    );
+}
+
+function propagatePromotedCopyState(
+  copies: Record<string, PromotedCopySnapshot>,
+  holderUserId: string,
+) {
+  const next = { ...copies };
+  const queue = [holderUserId];
+  const visited = new Set<string>();
+
+  while (queue.length > 0) {
+    const parentId = queue.shift()!;
+    if (visited.has(parentId)) continue;
+    visited.add(parentId);
+    const parent = next[parentId];
+    if (!parent) continue;
+
+    Object.entries(next).forEach(([childId, child]) => {
+      if (
+        child.promotedFromUserId !== parentId ||
+        child.outOfSync ||
+        visited.has(childId)
+      ) {
+        return;
+      }
+      next[childId] = {
+        ...child,
+        start: parent.start,
+        duration: parent.duration,
+        lastSyncedAt: parent.lastLocalEditAt ?? parent.lastSyncedAt,
+        outOfSync: false,
+        differences: [],
+      };
+      queue.push(childId);
+    });
+  }
+
+  return next;
+}
+
 function shiftConnectedItems(
   personas: Persona[],
   itemId: string,
@@ -395,34 +465,44 @@ function shiftConnectedItems(
       connectedIds.has(item.id)
         ? (() => {
           const nextStart = Math.round((item.start + delta) * 10) / 10;
-          const promotedCopies = item.promotedCopies
-            ? Object.fromEntries(
-              Object.entries(item.promotedCopies).map(([userId, copy]) =>
-                copy.outOfSync
-                  ? [
-                    userId,
-                    {
-                      ...copy,
-                      differences: Array.from(
-                        new Set([
-                          ...copy.differences,
-                          "Source schedule changed after the local edit",
-                        ]),
-                      ),
-                    },
-                  ]
-                  : [
-                    userId,
-                    {
-                      ...copy,
-                      start: nextStart,
-                      duration: item.duration,
-                      lastSyncedAt: syncedAt,
-                    },
-                  ]
-              ),
-            )
+          let promotedCopies = item.promotedCopies
+            ? { ...item.promotedCopies }
             : undefined;
+          const updatedDirectCopies: string[] = [];
+          if (promotedCopies) {
+            Object.entries(promotedCopies).forEach(([userId, copy]) => {
+              const isDirectCopy = !copy.promotedFromUserId ||
+                copy.promotedFromUserId === persona.id;
+              if (!isDirectCopy) return;
+              if (copy.outOfSync) {
+                promotedCopies![userId] = {
+                  ...copy,
+                  differences: Array.from(
+                    new Set([
+                      ...copy.differences,
+                      "Source schedule changed after the local edit",
+                    ]),
+                  ),
+                };
+                return;
+              }
+              promotedCopies![userId] = {
+                ...copy,
+                start: nextStart,
+                duration: item.duration,
+                lastSyncedAt: syncedAt,
+                outOfSync: false,
+                differences: [],
+              };
+              updatedDirectCopies.push(userId);
+            });
+            updatedDirectCopies.forEach((userId) => {
+              promotedCopies = propagatePromotedCopyState(
+                promotedCopies!,
+                userId,
+              );
+            });
+          }
           return {
             ...item,
             start: nextStart,
@@ -445,9 +525,8 @@ function shiftConnectedItems(
   }));
 }
 
-function isHighSideOnlyRequest(
+function isCrossNetworkApprovalRequest(
   request: ApprovalRequest,
-  item: ScheduleItem,
   owner: Persona,
   personas: Persona[],
 ) {
@@ -456,9 +535,7 @@ function isHighSideOnlyRequest(
   );
   return Boolean(
     editor &&
-      item.promotion &&
-      !item.demotion &&
-      NETWORKS.indexOf(editor.network) > NETWORKS.indexOf(owner.network),
+      editor.network !== owner.network,
   );
 }
 
@@ -467,17 +544,25 @@ function normalizeApprovalBoundaries(personas: Persona[]) {
     ...owner,
     items: owner.items.map((item) => {
       const blockedRequests = (item.pendingApprovals ?? []).filter((request) =>
-        isHighSideOnlyRequest(request, item, owner, personas)
+        isCrossNetworkApprovalRequest(request, owner, personas)
       );
       if (blockedRequests.length === 0) return item;
       const promotedCopies = { ...item.promotedCopies };
       blockedRequests.forEach((request) => {
+        const editor = personas.find((persona) =>
+          persona.id === request.editorUserId
+        );
         const requestedStart = request.requestedStart ?? item.start;
         const differenceDays = Math.max(
           1,
           Math.round(Math.abs(requestedStart - item.start) * 1.2),
         );
         promotedCopies[request.editorUserId] = {
+          copyKind: editor &&
+              NETWORKS.indexOf(editor.network) <
+                NETWORKS.indexOf(owner.network)
+            ? "demoted"
+            : "promoted",
           start: requestedStart,
           duration: item.duration,
           lastSyncedAt: item.lastSyncedAt ?? request.submittedAt,
@@ -486,16 +571,58 @@ function normalizeApprovalBoundaries(personas: Persona[]) {
             `Start date is ${differenceDays} days ${
               requestedStart >= item.start ? "later" : "earlier"
             } than the source`,
-            "Local edit has not propagated to lower networks",
+            "Local edit has not propagated to other networks",
           ],
           lastLocalEditAt: request.submittedAt,
+          promotedFromUserId: owner.id,
         };
       });
       return {
         ...item,
         promotedCopies,
         pendingApprovals: (item.pendingApprovals ?? []).filter((request) =>
-          !isHighSideOnlyRequest(request, item, owner, personas)
+          !isCrossNetworkApprovalRequest(request, owner, personas)
+        ),
+      };
+    }),
+  }));
+}
+
+function normalizePersistedState(personas: Persona[]) {
+  return normalizeApprovalBoundaries(personas).map((owner) => ({
+    ...owner,
+    items: owner.items.map((item) => {
+      const ownerLevel = NETWORKS.indexOf(owner.network);
+      const validDemotionDestinations = NETWORKS.filter((_, index) =>
+        index < ownerLevel
+      );
+      const normalizedItem: ScheduleItem = {
+        ...item,
+        promotion: ownerLevel < NETWORKS.length - 1 &&
+          Boolean(item.promotion),
+        demotion: ownerLevel > 0 &&
+          Boolean(item.approvals && item.demotion),
+        destination: validDemotionDestinations.includes(item.destination)
+          ? item.destination
+          : validDemotionDestinations.at(-1) ?? owner.network,
+      };
+      if (!normalizedItem.promotedCopies) return normalizedItem;
+      return {
+        ...normalizedItem,
+        promotedCopies: Object.fromEntries(
+          Object.entries(normalizedItem.promotedCopies).map((
+            [userId, copy],
+          ) => [
+            userId,
+            copy.promotedFromUserId &&
+              copy.outOfSync &&
+              !copy.lastLocalEditAt &&
+              copy.differences.includes(
+                "Inherited from an out-of-sync promoted state",
+              )
+              ? { ...copy, outOfSync: false, differences: [] }
+              : copy,
+          ]),
         ),
       };
     }),
@@ -504,6 +631,7 @@ function normalizeApprovalBoundaries(personas: Persona[]) {
 
 const DEFAULTS = createDefaultPersonas();
 const STORAGE_KEY = "relay-sandbox-v1";
+const SCENARIO_SCHEMA_VERSION = 2;
 
 function Toggle({
   checked,
@@ -538,7 +666,7 @@ function App() {
   const [personas, setPersonas] = useState<Persona[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      return saved ? normalizeApprovalBoundaries(JSON.parse(saved)) : DEFAULTS;
+      return saved ? normalizePersistedState(JSON.parse(saved)) : DEFAULTS;
     } catch {
       return DEFAULTS;
     }
@@ -548,10 +676,39 @@ function App() {
     { userId: string; sourceId: string } | null
   >(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [activeView, setActiveView] = useState<AppView>(() =>
+    window.location.hash === "#changelog"
+      ? "changelog"
+      : window.location.hash === "#rules"
+      ? "rules"
+      : "sandbox"
+  );
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    setPersonas((current) => normalizeApprovalBoundaries(current));
+    const handleHashChange = () => {
+      setActiveView(
+        window.location.hash === "#changelog"
+          ? "changelog"
+          : window.location.hash === "#rules"
+          ? "rules"
+          : "sandbox",
+      );
+    };
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
+  useEffect(() => {
+    document.title = activeView === "changelog"
+      ? "Changelog · Data Motion"
+      : activeView === "rules"
+      ? "System Rules · Data Motion"
+      : "Data Motion";
+  }, [activeView]);
+
+  useEffect(() => {
+    setPersonas((current) => normalizePersistedState(current));
   }, []);
 
   useEffect(() => {
@@ -642,6 +799,7 @@ function App() {
             if (item.id !== itemId) return item;
             const existing = item.promotedCopies?.[holderUserId];
             const holderState: PromotedCopySnapshot = {
+              copyKind: existing?.copyKind ?? "promoted",
               start: existing?.start ?? item.start,
               duration: existing?.duration ?? item.duration,
               lastSyncedAt: existing?.lastSyncedAt ??
@@ -652,7 +810,7 @@ function App() {
               ...existing,
               ...patch,
             };
-            const promotedCopies = {
+            const promotedCopies: Record<string, PromotedCopySnapshot> = {
               ...item.promotedCopies,
               [holderUserId]: holderState,
             };
@@ -664,11 +822,12 @@ function App() {
                 return;
               }
               promotedCopies[entry.userId] = {
+                copyKind: "promoted",
                 start: holderState.start,
                 duration: holderState.duration,
                 lastSyncedAt: holderState.lastSyncedAt,
-                outOfSync: holderState.outOfSync,
-                differences: [...holderState.differences],
+                outOfSync: false,
+                differences: [],
                 promotedFromUserId: holderUserId,
               };
             });
@@ -685,17 +844,77 @@ function App() {
     ownerId: string,
     editorUserId: string,
     requiresApproval: boolean,
-    copyType?: "promoted" | "demoted" | null,
+    copyType?: "promoted" | "demoted" | "shared" | null,
   ) {
     setPersonas((current) => {
-      const sourceItem = current
-        .find((persona) => persona.id === ownerId)
+      const sourceOwner = current.find((persona) => persona.id === ownerId);
+      const editor = current.find((persona) => persona.id === editorUserId);
+      const sourceItem = sourceOwner
         ?.items.find((item) => item.id === itemId);
+      const isCrossNetworkEdit = Boolean(
+        sourceOwner &&
+          editor &&
+          sourceOwner.network !== editor.network,
+      );
       if (
         ownerId !== editorUserId &&
+        isCrossNetworkEdit &&
+        copyType === "demoted" &&
+        sourceItem
+      ) {
+        const editedAt = new Date().toISOString();
+        return current.map((persona) =>
+          persona.id === ownerId
+            ? {
+              ...persona,
+              items: persona.items.map((item) => {
+                if (item.id !== itemId) return item;
+                const existing = item.promotedCopies?.[editorUserId];
+                const base = existing?.copyKind === "demoted"
+                  ? existing
+                  : item.demotedSnapshot;
+                if (!base) return item;
+                const nextStart = Math.max(
+                  0,
+                  Math.min(
+                    100 - base.duration,
+                    Math.round((base.start + requestedDelta) * 10) / 10,
+                  ),
+                );
+                const differenceDays = Math.max(
+                  1,
+                  Math.round(Math.abs(nextStart - base.start) * 1.2),
+                );
+                return {
+                  ...item,
+                  promotedCopies: {
+                    ...item.promotedCopies,
+                    [editorUserId]: {
+                      ...existing,
+                      copyKind: "demoted",
+                      start: nextStart,
+                      duration: base.duration,
+                      lastSyncedAt: base.lastSyncedAt,
+                      outOfSync: true,
+                      differences: [
+                        `Local released-copy date differs by ${differenceDays} days`,
+                        "Local edit has not propagated to other networks",
+                      ],
+                      lastLocalEditAt: editedAt,
+                      promotedFromUserId: ownerId,
+                    },
+                  },
+                };
+              }),
+            }
+            : persona
+        );
+      }
+      if (
+        ownerId !== editorUserId &&
+        isCrossNetworkEdit &&
         copyType === "promoted" &&
-        sourceItem &&
-        !sourceItem.demotion
+        sourceItem
       ) {
         const connectedIds = new Set([itemId]);
         const viewerDependencies = current
@@ -757,10 +976,11 @@ function App() {
                 : []),
               "Local edit has not propagated to lower networks",
             ];
-            const promotedCopies = {
+            const promotedCopies: Record<string, PromotedCopySnapshot> = {
               ...item.promotedCopies,
               [editorUserId]: {
                 ...existing,
+                copyKind: "promoted",
                 start: nextStart,
                 duration: existing?.duration ?? item.duration,
                 lastSyncedAt: existing?.lastSyncedAt ??
@@ -769,38 +989,24 @@ function App() {
                 outOfSync: true,
                 differences,
                 lastLocalEditAt: editedAt,
+                promotedFromUserId: existing?.promotedFromUserId ?? ownerId,
               },
             };
-            Object.entries(promotedCopies).forEach(([holderId, copy]) => {
-              if (
-                holderId === editorUserId ||
-                copy.promotedFromUserId !== editorUserId ||
-                copy.outOfSync
-              ) {
-                return;
-              }
-              promotedCopies[holderId] = {
-                ...copy,
-                start: nextStart,
-                duration: existing?.duration ?? item.duration,
-                lastSyncedAt: editedAt,
-                outOfSync: true,
-                differences: Array.from(
-                  new Set([
-                    ...differences,
-                    "Inherited from an out-of-sync promoted state",
-                  ]),
-                ),
-              };
-            });
             return {
               ...item,
-              promotedCopies,
+              promotedCopies: propagatePromotedCopyState(
+                promotedCopies,
+                editorUserId,
+              ),
             };
           }),
         }));
       }
-      if (ownerId !== editorUserId && requiresApproval) {
+      if (
+        ownerId !== editorUserId &&
+        !isCrossNetworkEdit &&
+        requiresApproval
+      ) {
         return current.map((persona) =>
           persona.id === ownerId
             ? {
@@ -982,47 +1188,47 @@ function App() {
         persona.id === ownerId
           ? {
             ...persona,
-            items: persona.items.map((entry) =>
-              entry.id === itemId
-                ? {
-                  ...entry,
-                  promotedCopies: {
+            items: persona.items.map((entry) => {
+              if (entry.id !== itemId) return entry;
+              const nextState: PromotedCopySnapshot = {
+                start: stateId === "local"
+                  ? existing?.start ?? base!.start
+                  : selected!.start,
+                duration: stateId === "local"
+                  ? existing?.duration ?? base!.duration
+                  : selected!.duration,
+                lastSyncedAt: stateId === "local"
+                  ? existing?.lastSyncedAt ??
+                    base?.lastSyncedAt ??
+                    new Date().toISOString()
+                  : selected!.lastSyncedAt ?? new Date().toISOString(),
+                outOfSync: stateId === "local",
+                differences: stateId === "local"
+                  ? [
+                    ...(existing?.differences ?? []),
+                    "Independent local state retained",
+                  ]
+                  : [],
+                access: existing?.access,
+                promotion: existing?.promotion,
+                promotedFromUserId: stateId === "local"
+                  ? existing?.promotedFromUserId
+                  : selected!.holderUserId,
+                reconciledCandidateSignature: promotionCandidateSignature(
+                  candidates,
+                ),
+              };
+              return {
+                ...entry,
+                promotedCopies: propagatePromotedCopyState(
+                  {
                     ...entry.promotedCopies,
-                    [viewerId]: {
-                      start: stateId === "local"
-                        ? existing?.start ?? base!.start
-                        : selected!.start,
-                      duration: stateId === "local"
-                        ? existing?.duration ?? base!.duration
-                        : selected!.duration,
-                      lastSyncedAt: stateId === "local"
-                        ? existing?.lastSyncedAt ??
-                          base?.lastSyncedAt ??
-                          new Date().toISOString()
-                        : selected!.lastSyncedAt ??
-                          new Date().toISOString(),
-                      outOfSync: stateId === "local"
-                        ? true
-                        : selected!.outOfSync,
-                      differences: stateId === "local"
-                        ? [
-                          ...(existing?.differences ?? []),
-                          "Independent local state retained",
-                        ]
-                        : [...selected!.differences],
-                      access: existing?.access,
-                      promotion: existing?.promotion,
-                      promotedFromUserId: stateId === "local"
-                        ? existing?.promotedFromUserId
-                        : selected!.holderUserId,
-                      reconciledCandidateSignature: promotionCandidateSignature(
-                        candidates,
-                      ),
-                    },
+                    [viewerId]: nextState,
                   },
-                }
-                : entry
-            ),
+                  viewerId,
+                ),
+              };
+            }),
           }
           : persona
       );
@@ -1057,6 +1263,32 @@ function App() {
           : persona
       );
     });
+  }
+
+  function resetLocalDemotedCopy(
+    ownerId: string,
+    itemId: string,
+    viewerId: string,
+  ) {
+    setPersonas((current) =>
+      current.map((persona) =>
+        persona.id === ownerId
+          ? {
+            ...persona,
+            items: persona.items.map((item) => {
+              if (
+                item.id !== itemId ||
+                item.promotedCopies?.[viewerId]?.copyKind !== "demoted"
+              ) {
+                return item;
+              }
+              const { [viewerId]: _, ...remainingCopies } = item.promotedCopies;
+              return { ...item, promotedCopies: remainingCopies };
+            }),
+          }
+          : persona
+      )
+    );
   }
 
   function addPersona() {
@@ -1108,25 +1340,22 @@ function App() {
         );
         if (exists) return current;
 
-        const approvalOwner = current.find((persona) =>
+        const sharedOwner = current.find((persona) =>
           persona.id !== viewingUserId &&
           persona.items.some((item) =>
-            (item.id === dependency[0] || item.id === dependency[1]) &&
-            item.approvals
+            item.id === dependency[0] || item.id === dependency[1]
           )
         );
-        const approvalItem = approvalOwner?.items.find((item) =>
-          (item.id === dependency[0] || item.id === dependency[1]) &&
-          item.approvals
+        const sharedItem = sharedOwner?.items.find((item) =>
+          item.id === dependency[0] || item.id === dependency[1]
         );
-        const isHighSideLocalEdit = Boolean(
-          approvalOwner &&
-            approvalItem?.promotion &&
-            !approvalItem.demotion &&
-            NETWORKS.indexOf(viewer!.network) >
-              NETWORKS.indexOf(approvalOwner.network),
+        const isCrossNetworkLocalEdit = Boolean(
+          viewer &&
+            sharedOwner &&
+            sharedItem &&
+            viewer.network !== sharedOwner.network,
         );
-        if (approvalOwner && approvalItem && isHighSideLocalEdit) {
+        if (sharedOwner && sharedItem && isCrossNetworkLocalEdit) {
           const editedAt = new Date().toISOString();
           return current.map((persona) => {
             const withDependency = persona.id === viewingUserId
@@ -1135,20 +1364,27 @@ function App() {
                 dependencies: [...persona.dependencies, dependency],
               }
               : persona;
-            if (persona.id !== approvalOwner.id) return withDependency;
+            if (persona.id !== sharedOwner.id) return withDependency;
             return {
               ...withDependency,
               items: withDependency.items.map((item) => {
-                if (item.id !== approvalItem.id) return item;
+                if (item.id !== sharedItem.id) return item;
                 const existing = item.promotedCopies?.[viewingUserId];
+                const isDemotedState = NETWORKS.indexOf(viewer!.network) <
+                    NETWORKS.indexOf(sharedOwner.network) &&
+                  Boolean(item.demotion || item.demotedSnapshot);
+                const base = existing ??
+                  (isDemotedState ? item.demotedSnapshot : undefined);
                 return {
                   ...item,
                   promotedCopies: {
                     ...item.promotedCopies,
                     [viewingUserId]: {
-                      start: existing?.start ?? item.start,
-                      duration: existing?.duration ?? item.duration,
-                      lastSyncedAt: existing?.lastSyncedAt ??
+                      ...existing,
+                      copyKind: isDemotedState ? "demoted" : "promoted",
+                      start: base?.start ?? item.start,
+                      duration: base?.duration ?? item.duration,
+                      lastSyncedAt: base?.lastSyncedAt ??
                         item.lastSyncedAt ??
                         editedAt,
                       outOfSync: true,
@@ -1156,7 +1392,7 @@ function App() {
                         new Set([
                           ...(existing?.differences ?? []),
                           "Dependency timing differs from the source schedule",
-                          "Local edit has not propagated to lower networks",
+                          "Local edit has not propagated to other networks",
                         ]),
                       ),
                       lastLocalEditAt: editedAt,
@@ -1164,6 +1400,7 @@ function App() {
                         ...(existing?.localDependencies ?? []),
                         dependency,
                       ],
+                      promotedFromUserId: sharedOwner.id,
                     },
                   },
                 };
@@ -1171,6 +1408,8 @@ function App() {
             };
           });
         }
+        const approvalOwner = sharedItem?.approvals ? sharedOwner : undefined;
+        const approvalItem = sharedItem?.approvals ? sharedItem : undefined;
         if (approvalOwner && approvalItem) {
           return current.map((persona) =>
             persona.id === approvalOwner.id
@@ -1232,7 +1471,13 @@ function App() {
   }
 
   function exportScenario() {
-    const blob = new Blob([JSON.stringify({ version: 1, personas }, null, 2)], {
+    const blob = new Blob([
+      JSON.stringify(
+        { version: SCENARIO_SCHEMA_VERSION, personas },
+        null,
+        2,
+      ),
+    ], {
       type: "application/json",
     });
     const url = URL.createObjectURL(blob);
@@ -1252,7 +1497,7 @@ function App() {
       try {
         const value = JSON.parse(text);
         if (Array.isArray(value.personas)) {
-          setPersonas(normalizeApprovalBoundaries(value.personas.slice(0, 6)));
+          setPersonas(normalizePersistedState(value.personas.slice(0, 6)));
         }
       } catch {
         window.alert("That file is not a valid Data Motion scenario.");
@@ -1274,6 +1519,21 @@ function App() {
     setLinking(null);
   }
 
+  function navigateTo(view: AppView) {
+    setActiveView(view);
+    setModal(null);
+    setLinking(null);
+    window.history.pushState(
+      null,
+      "",
+      view === "sandbox"
+        ? `${window.location.pathname}${window.location.search}`
+        : `${window.location.pathname}#${
+          view === "changelog" ? "changelog" : "rules"
+        }`,
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -1287,175 +1547,272 @@ function App() {
           </div>
         </div>
         <div className="topbar-status">
-          <span className="status-dot" />
-          {savedAt ? `Saved locally · ${savedAt}` : "Local scenario"}
+          {activeView === "sandbox"
+            ? (
+              <>
+                <span className="status-dot" />
+                {savedAt ? `Saved locally · ${savedAt}` : "Local scenario"}
+              </>
+            )
+            : activeView === "rules"
+            ? "Behavioral rulebook"
+            : "Product release history"}
         </div>
         <div className="topbar-actions">
-          <button className="icon-button labelled" onClick={resetScenario}>
-            <RotateCcw size={16} /> Reset
+          {activeView !== "sandbox" && (
+            <button
+              className="icon-button labelled"
+              onClick={() => navigateTo("sandbox")}
+            >
+              <ArrowLeft size={16} /> Sandbox
+            </button>
+          )}
+          <button
+            className={`icon-button labelled ${
+              activeView === "rules" ? "is-active" : ""
+            }`}
+            onClick={() => navigateTo("rules")}
+          >
+            <BookOpen size={16} /> Rules
           </button>
           <button
-            className="icon-button labelled"
-            onClick={() => fileRef.current?.click()}
+            className={`icon-button labelled ${
+              activeView === "changelog" ? "is-active" : ""
+            }`}
+            onClick={() => navigateTo("changelog")}
           >
-            <Upload size={16} /> Import
+            <History size={16} /> Changelog
           </button>
-          <button className="icon-button labelled" onClick={exportScenario}>
-            <Download size={16} /> Export
-          </button>
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".json,application/json"
-            hidden
-            onChange={importScenario}
-          />
+          {activeView === "sandbox" && (
+            <>
+              <button className="icon-button labelled" onClick={resetScenario}>
+                <RotateCcw size={16} /> Reset
+              </button>
+              <button
+                className="icon-button labelled"
+                onClick={() => fileRef.current?.click()}
+              >
+                <Upload size={16} /> Import
+              </button>
+              <button className="icon-button labelled" onClick={exportScenario}>
+                <Download size={16} /> Export
+              </button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".json,application/json"
+                hidden
+                onChange={importScenario}
+              />
+            </>
+          )}
         </div>
       </header>
 
-      <main>
-        <section className="intro">
-          <div>
-            <div className="eyebrow">
-              Scenario workspace · {personas.length}/6 sessions
-            </div>
-            <h1>
-              See how work moves<br />across boundaries.
-            </h1>
-          </div>
-          <div className="intro-side">
-            <p>
-              Configure independent user sessions, then test schedule access,
-              release controls, and cross-network propagation.
-            </p>
-            <div className="network-legend">
-              {NETWORKS.map((network, index) => (
-                <span key={network}>
-                  <i data-level={index} />
-                  {network}
-                </span>
-              ))}
-            </div>
-          </div>
-        </section>
+      {activeView === "sandbox"
+        ? (
+          <main>
+            <section className="intro">
+              <div>
+                <div className="eyebrow">
+                  Scenario workspace · {personas.length}/6 sessions
+                </div>
+                <h1>
+                  See how work moves<br />across boundaries.
+                </h1>
+              </div>
+              <div className="intro-side">
+                <p>
+                  Configure independent user sessions, then test schedule
+                  access, release controls, and cross-network propagation.
+                </p>
+                <div className="network-legend">
+                  {NETWORKS.map((network, index) => (
+                    <span key={network}>
+                      <i data-level={index} />
+                      {network}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </section>
 
-        {linking && (
-          <div className="linking-banner">
-            <Link2 size={16} />
-            Choose a destination item in the same window.
-            <button onClick={() => setLinking(null)}>Cancel</button>
-          </div>
-        )}
+            {linking && (
+              <div className="linking-banner">
+                <Link2 size={16} />
+                Choose a destination item in the same window.
+                <button onClick={() => setLinking(null)}>Cancel</button>
+              </div>
+            )}
 
-        <section className="browser-grid">
-          {personas.map((persona, index) => (
-            <BrowserWindow
-              key={persona.id}
-              persona={persona}
-              index={index}
-              sharedItems={personas.flatMap((source) =>
-                source.id === persona.id ? [] : source.items
-                  .flatMap((item) => {
-                    const recipientLevel = NETWORKS.indexOf(persona.network);
-                    const sourceLevel = NETWORKS.indexOf(source.network);
-                    const hasOriginAccess = item.access.some((entry) =>
-                      entry.userId === persona.id &&
-                      entry.permission !== "none"
-                    );
-                    const isDemotedCopy = hasOriginAccess &&
-                      recipientLevel < sourceLevel &&
-                      item.destination === persona.network &&
-                      Boolean(item.demotion || item.demotedSnapshot);
-                    const promotionCandidates = getPromotionCandidates(
-                      item,
-                      source,
-                      persona,
-                      personas,
-                    );
-                    const isPromotedCopy = promotionCandidates.length > 0;
-                    if (!isDemotedCopy && !isPromotedCopy) return [];
-                    const promotedSnapshot = item.promotedCopies?.[persona.id];
-                    const inheritedPromotionState = promotionCandidates[0];
-                    const displayedItem = isDemotedCopy && item.demotedSnapshot
-                      ? {
-                        ...item,
-                        ...item.demotedSnapshot,
-                        pendingApprovals: [],
-                        demotionOutOfSync: false,
-                      }
-                      : isPromotedCopy && promotedSnapshot
-                      ? {
-                        ...item,
-                        ...promotedSnapshot,
-                        pendingApprovals: [],
-                      }
-                      : isPromotedCopy && inheritedPromotionState
-                      ? {
-                        ...item,
-                        start: inheritedPromotionState.start,
-                        duration: inheritedPromotionState.duration,
-                        lastSyncedAt: inheritedPromotionState.lastSyncedAt,
-                        pendingApprovals: [],
-                      }
-                      : item;
-                    return [{
-                      item: displayedItem,
-                      ownerId: source.id,
-                      ownerName: source.name,
-                      origin: source.network,
-                      copyType: (isDemotedCopy ? "demoted" : "promoted") as
-                        | "demoted"
-                        | "promoted",
-                      copyOutOfSync: isPromotedCopy &&
-                        Boolean(
-                          promotedSnapshot?.outOfSync ??
-                            inheritedPromotionState?.outOfSync,
-                        ),
-                      differences: isPromotedCopy
-                        ? promotedSnapshot?.differences ??
-                          inheritedPromotionState?.differences ??
-                          []
-                        : [],
-                      promotionConflict: isPromotedCopy &&
-                        promotionCandidates.length > 1 &&
-                        promotedSnapshot?.reconciledCandidateSignature !==
-                          promotionCandidateSignature(promotionCandidates),
-                      promotionCandidates,
-                      permission: isPromotedCopy
-                        ? promotionCandidates.some((candidate) =>
-                            candidate.permission === "write"
+            <section className="browser-grid">
+              {personas.map((persona, index) => (
+                <BrowserWindow
+                  key={persona.id}
+                  persona={persona}
+                  index={index}
+                  sharedItems={personas.flatMap((source) =>
+                    source.id === persona.id ? [] : source.items
+                      .flatMap((item) => {
+                        const recipientLevel = NETWORKS.indexOf(
+                          persona.network,
+                        );
+                        const sourceLevel = NETWORKS.indexOf(source.network);
+                        const hasOriginAccess = item.access.some((entry) =>
+                          entry.userId === persona.id &&
+                          entry.permission !== "none"
+                        );
+                        const isDemotedCopy = hasOriginAccess &&
+                          recipientLevel < sourceLevel &&
+                          item.destination === persona.network &&
+                          Boolean(item.demotion || item.demotedSnapshot);
+                        const isSameNetworkShare = hasOriginAccess &&
+                          recipientLevel === sourceLevel;
+                        const promotionCandidates = getPromotionCandidates(
+                          item,
+                          source,
+                          persona,
+                          personas,
+                        );
+                        const isPromotedCopy = promotionCandidates.length > 0;
+                        if (
+                          !isDemotedCopy &&
+                          !isPromotedCopy &&
+                          !isSameNetworkShare
+                        ) {
+                          return [];
+                        }
+                        const promotedSnapshot = item.promotedCopies
+                          ?.[persona.id];
+                        const localDemotedSnapshot = isDemotedCopy &&
+                            promotedSnapshot?.copyKind === "demoted"
+                          ? promotedSnapshot
+                          : undefined;
+                        const inheritedPromotionState = promotionCandidates[0];
+                        const copyHasMeaningfulDifference = promotedSnapshot
+                          ? promotedCopyDiffersFromSources(
+                            promotedSnapshot,
+                            promotionCandidates,
                           )
-                          ? "write" as Permission
-                          : "read" as Permission
-                        : item.access.find((entry) =>
-                          entry.userId === persona.id
-                        )?.permission ?? "read",
-                    }];
-                  })
+                          : false;
+                        const displayedItem =
+                          isDemotedCopy && localDemotedSnapshot
+                            ? {
+                              ...item,
+                              ...localDemotedSnapshot,
+                              pendingApprovals: [],
+                              demotionOutOfSync: false,
+                            }
+                            : isDemotedCopy && item.demotedSnapshot
+                            ? {
+                              ...item,
+                              ...item.demotedSnapshot,
+                              pendingApprovals: [],
+                              demotionOutOfSync: false,
+                            }
+                            : isPromotedCopy && promotedSnapshot
+                            ? {
+                              ...item,
+                              ...promotedSnapshot,
+                              pendingApprovals: [],
+                            }
+                            : isPromotedCopy && inheritedPromotionState
+                            ? {
+                              ...item,
+                              start: inheritedPromotionState.start,
+                              duration: inheritedPromotionState.duration,
+                              lastSyncedAt:
+                                inheritedPromotionState.lastSyncedAt,
+                              pendingApprovals: [],
+                            }
+                            : item;
+                        return [{
+                          item: displayedItem,
+                          ownerId: source.id,
+                          ownerName: source.name,
+                          origin: source.network,
+                          copyType: (isDemotedCopy
+                            ? "demoted"
+                            : isPromotedCopy
+                            ? "promoted"
+                            : "shared") as
+                              | "demoted"
+                              | "promoted"
+                              | "shared",
+                          copyOutOfSync: isDemotedCopy && localDemotedSnapshot
+                            ? Boolean(
+                              localDemotedSnapshot.outOfSync &&
+                                item.demotedSnapshot &&
+                                (localDemotedSnapshot.start !==
+                                    item.demotedSnapshot.start ||
+                                  localDemotedSnapshot.duration !==
+                                    item.demotedSnapshot.duration),
+                            )
+                            : isPromotedCopy &&
+                              Boolean(
+                                promotedSnapshot?.outOfSync ??
+                                  inheritedPromotionState?.outOfSync,
+                              ) &&
+                              (promotedSnapshot
+                                ? copyHasMeaningfulDifference
+                                : Boolean(inheritedPromotionState?.outOfSync)),
+                          differences: isDemotedCopy && localDemotedSnapshot
+                            ? localDemotedSnapshot.differences
+                            : isPromotedCopy
+                            ? promotedSnapshot?.differences ??
+                              inheritedPromotionState?.differences ??
+                              []
+                            : [],
+                          promotionConflict: isPromotedCopy &&
+                            promotionCandidates.length > 1 &&
+                            promotionCandidatesConflict(promotionCandidates) &&
+                            promotedSnapshot?.reconciledCandidateSignature !==
+                              promotionCandidateSignature(promotionCandidates),
+                          promotionCandidates,
+                          permission: isPromotedCopy
+                            ? promotionCandidates.some((candidate) =>
+                                candidate.permission === "write"
+                              )
+                              ? "write" as Permission
+                              : "read" as Permission
+                            : item.access.find((entry) =>
+                              entry.userId === persona.id
+                            )?.permission ?? "read",
+                        }];
+                      })
+                  )}
+                  isLinking={linking?.userId === persona.id}
+                  linkingSource={linking?.sourceId}
+                  onConfigure={() =>
+                    setModal({ type: "settings", userId: persona.id })}
+                  onRemove={() => removePersona(persona.id)}
+                  onItemClick={(itemId, ownerId, canWrite) =>
+                    handleItemClick(persona.id, itemId, ownerId, canWrite)}
+                  onMoveItem={moveItem}
+                  onStartLink={(sourceId) =>
+                    setLinking({ userId: persona.id, sourceId })}
+                />
+              ))}
+              {personas.length < 6 && (
+                <button className="add-window" onClick={addPersona}>
+                  <span>
+                    <Plus size={22} />
+                  </span>
+                  <strong>Add browser window</strong>
+                  <small>Create another user perspective</small>
+                </button>
               )}
-              isLinking={linking?.userId === persona.id}
-              linkingSource={linking?.sourceId}
-              onConfigure={() =>
-                setModal({ type: "settings", userId: persona.id })}
-              onRemove={() => removePersona(persona.id)}
-              onItemClick={(itemId, ownerId, canWrite) =>
-                handleItemClick(persona.id, itemId, ownerId, canWrite)}
-              onMoveItem={moveItem}
-              onStartLink={(sourceId) =>
-                setLinking({ userId: persona.id, sourceId })}
-            />
-          ))}
-          {personas.length < 6 && (
-            <button className="add-window" onClick={addPersona}>
-              <span>
-                <Plus size={22} />
-              </span>
-              <strong>Add browser window</strong>
-              <small>Create another user perspective</small>
-            </button>
-          )}
-        </section>
-      </main>
+            </section>
+          </main>
+        )
+        : activeView === "rules"
+        ? (
+          <RulesPage
+            onBack={() => navigateTo("sandbox")}
+            onChangelog={() => navigateTo("changelog")}
+          />
+        )
+        : <ChangelogPage onBack={() => navigateTo("sandbox")} />}
 
       <footer>
         <span>DATA MOTION / PROTOTYPE 0.1</span>
@@ -1499,6 +1856,13 @@ function App() {
               accessModal.user!.id,
               accessModal.item!.id,
             )}
+          onResetLocalDemotedCopy={() =>
+            accessModal.viewingUser &&
+            resetLocalDemotedCopy(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              accessModal.viewingUser.id,
+            )}
           onResolveApproval={(requestId, approved) =>
             resolveApproval(
               accessModal.user!.id,
@@ -1522,6 +1886,348 @@ function App() {
   );
 }
 
+function RulesPage({
+  onBack,
+  onChangelog,
+}: {
+  onBack: () => void;
+  onChangelog: () => void;
+}) {
+  const rules: {
+    number: string;
+    icon: React.ReactNode;
+    title: string;
+    statement: string;
+    details: string[];
+  }[] = [
+    {
+      number: "01",
+      icon: <Users size={18} />,
+      title: "Same network means one shared state",
+      statement:
+        "Collaborators on the same network are looking at the same authoritative schedule.",
+      details: [
+        "Viewers inspect; Editors can change dates and dependencies.",
+        "If local approvals are on, Editor changes wait for the state owner.",
+        "Without approvals, Editor changes are immediate for everyone on that network.",
+      ],
+    },
+    {
+      number: "02",
+      icon: <ArrowUpToLine size={18} />,
+      title: "Promotion creates an up-network synced copy",
+      statement:
+        "A promoted copy follows its immediate source until someone explicitly edits that copy.",
+      details: [
+        "Promotion does not require approvals.",
+        "A copy can be promoted onward while preserving its immediate source lineage.",
+        "Matching incoming states do not create warnings.",
+      ],
+    },
+    {
+      number: "03",
+      icon: <ArrowDownToLine size={18} />,
+      title: "Demotion releases an approved snapshot",
+      statement:
+        "Down-network distribution is deliberate, destination-specific, and protected by local review.",
+      details: [
+        "Demotion requires local owner approvals to be enabled.",
+        "The receiving network sees Approved for release, never the source network.",
+        "Promotion and demotion can operate at the same time.",
+      ],
+    },
+    {
+      number: "04",
+      icon: <GitBranch size={18} />,
+      title: "Cross-network edits create divergence",
+      statement:
+        "Editing a synced copy changes only that network state. It never silently changes another network.",
+      details: [
+        "Cross-network edits do not create approval requests.",
+        "The edited copy becomes out of sync with its immediate source.",
+        "Other synced descendants keep following it until they explicitly diverge.",
+      ],
+    },
+    {
+      number: "05",
+      icon: <Shield size={18} />,
+      title: "Approvals are local governance",
+      statement:
+        "Approval requests exist only between Editors and the owner of the same network state.",
+      details: [
+        "Owners approve or deny date and dependency proposals.",
+        "Owners' own changes are inherently approved.",
+        "Remote versions are reconciled, not approved or denied.",
+      ],
+    },
+    {
+      number: "06",
+      icon: <Waypoints size={18} />,
+      title: "Multiple sources require an explicit choice",
+      statement:
+        "When different lower-network states reach one recipient, no version silently wins.",
+      details: [
+        "The recipient sees each active source owner and network state.",
+        "Alerts appear only when the actual schedule states differ.",
+        "The state owner can sync to a source or retain an independent local state.",
+      ],
+    },
+  ];
+
+  return (
+    <main className="rules-page">
+      <section className="rules-hero">
+        <div>
+          <button className="changelog-back" onClick={onBack}>
+            <ArrowLeft size={14} /> Back to sandbox
+          </button>
+          <div className="eyebrow">System rulebook · Version 1</div>
+          <h1>
+            One object.<br />Many governed states.
+          </h1>
+          <p className="rules-hero-copy">
+            Data Motion treats every network as its own decision boundary.
+            Sharing connects states; it does not erase their ownership.
+          </p>
+        </div>
+        <div className="rules-thesis">
+          <Waypoints size={24} />
+          <span>The shortest version</span>
+          <strong>
+            Same-network changes are collaborative. Cross-network changes are
+            synchronized or intentionally divergent.
+          </strong>
+          <div>
+            <i /> No invisible propagation
+            <i /> No surprise approvals
+            <i /> No silent conflict winner
+          </div>
+        </div>
+      </section>
+
+      <section className="network-rule">
+        <div className="rules-section-heading">
+          <h2>The network is an ordered boundary</h2>
+          <p>
+            Information can move in either direction, but the meaning and
+            controls change with direction.
+          </p>
+        </div>
+        <div className="network-rule-rail">
+          {NETWORKS.map((network, index) => (
+            <div className="network-rule-node" key={network}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              <strong>{network}</strong>
+              {index < NETWORKS.length - 1 && <ArrowRight size={14} />}
+            </div>
+          ))}
+        </div>
+        <div className="direction-rule-grid">
+          <div>
+            <ArrowUpToLine size={18} />
+            <strong>Up-network · Promotion</strong>
+            <span>Live synced lineage, no approval prerequisite</span>
+          </div>
+          <div>
+            <ArrowDownToLine size={18} />
+            <strong>Down-network · Demotion</strong>
+            <span>Approved release snapshot, explicit destination</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="behavior-rules">
+        <div className="rules-section-heading">
+          <h2>Six decisions govern every flow</h2>
+          <p>
+            Read these rules in order when features appear to conflict.
+          </p>
+        </div>
+        <div className="behavior-rule-list">
+          {rules.map((rule) => (
+            <article className="behavior-rule" key={rule.number}>
+              <span className="behavior-rule-number">{rule.number}</span>
+              <div className="behavior-rule-icon">{rule.icon}</div>
+              <div className="behavior-rule-copy">
+                <h3>{rule.title}</h3>
+                <p>{rule.statement}</p>
+              </div>
+              <ul>
+                {rule.details.map((detail) => (
+                  <li key={detail}>
+                    <Check size={11} /> {detail}
+                  </li>
+                ))}
+              </ul>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="state-lifecycle">
+        <div className="rules-section-heading">
+          <h2>How a state moves through the system</h2>
+          <p>
+            A copy remains synchronized until a person makes a local decision.
+          </p>
+        </div>
+        <div className="lifecycle-track">
+          {[
+            ["Originate", "An owner controls the authoritative network state."],
+            [
+              "Distribute",
+              "Access plus promotion or demotion creates a receiving state.",
+            ],
+            [
+              "Diverge",
+              "A cross-network Editor makes an intentional local change.",
+            ],
+            [
+              "Reconcile",
+              "The state owner chooses a remote version or keeps local work.",
+            ],
+          ].map(([title, description], index) => (
+            <div className="lifecycle-step" key={title}>
+              <span>{index + 1}</span>
+              <strong>{title}</strong>
+              <p>{description}</p>
+              {index < 3 && <ArrowRight size={15} />}
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="hard-boundaries">
+        <div>
+          <Shield size={25} />
+          <h2>Hard boundaries</h2>
+          <p>
+            These constraints protect network intent even when a scenario is
+            complicated.
+          </p>
+        </div>
+        <ol>
+          {[
+            "Nothing flows down-network unless demotion is enabled.",
+            "Cross-network edits never become approval requests.",
+            "Matching states never create conflict noise.",
+            "Viewers cannot mutate dates, sharing, or governance.",
+            "Rigid dependencies move together inside their active state.",
+            "Only the applicable state owner can reconcile versions.",
+          ].map((boundary, index) => (
+            <li key={boundary}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              {boundary}
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <section className="qa-invitation">
+        <div className="qa-invitation-mark">
+          <BookOpen size={24} />
+        </div>
+        <div>
+          <h2>Ask the executable specification</h2>
+          <p>
+            The complete QA scenario document covers combinations, edge cases,
+            expected alerts, and release criteria. Open it directly, or load it
+            into your favorite LLM to ask behavioral questions in plain
+            language.
+          </p>
+          <code>
+            “Using QA_SCENARIOS.md, explain who sees a change, whether approval
+            is required, and which state moves in this scenario…”
+          </code>
+        </div>
+        <div className="qa-invitation-actions">
+          <a
+            href="https://github.com/sloanal/data-motion/blob/main/QA_SCENARIOS.md"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Open QA_SCENARIOS.md <ExternalLink size={13} />
+          </a>
+          <button onClick={onChangelog}>
+            View changelog <ArrowRight size={13} />
+          </button>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function ChangelogPage({ onBack }: { onBack: () => void }) {
+  return (
+    <main className="changelog-page">
+      <section className="changelog-hero">
+        <div>
+          <button className="changelog-back" onClick={onBack}>
+            <ArrowLeft size={14} /> Back to sandbox
+          </button>
+          <div className="eyebrow">
+            Product updates · {CHANGELOG.length} releases
+          </div>
+          <h1>
+            What’s new in<br />Data Motion.
+          </h1>
+        </div>
+        <div className="changelog-intro">
+          <History size={22} />
+          <p>
+            Follow new capabilities, behavior changes, and fixes across the
+            schedule synchronization sandbox.
+          </p>
+          <span>Latest release · v{CHANGELOG[0].version}</span>
+        </div>
+      </section>
+
+      <section className="release-list" aria-label="Release history">
+        {CHANGELOG.map((release, index) => (
+          <article className="release-card" key={release.version}>
+            <div className="release-marker">
+              <i className={index === 0 ? "latest" : ""} />
+              {index < CHANGELOG.length - 1 && <span />}
+            </div>
+            <div className="release-meta">
+              <span>v{release.version}</span>
+              <time dateTime={release.date}>
+                {new Date(`${release.date}T12:00:00`).toLocaleDateString([], {
+                  month: "long",
+                  day: "numeric",
+                  year: "numeric",
+                })}
+              </time>
+              {index === 0 && <strong>Latest</strong>}
+            </div>
+            <div className="release-content">
+              <div className="release-heading">
+                <div>
+                  <h2>{release.title}</h2>
+                  <p>{release.summary}</p>
+                </div>
+                <div className="release-categories">
+                  {release.categories.map((category) => (
+                    <span key={category}>{category}</span>
+                  ))}
+                </div>
+              </div>
+              <ul>
+                {release.changes.map((change) => (
+                  <li key={change}>
+                    <Check size={12} />
+                    <span>{change}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </article>
+        ))}
+      </section>
+    </main>
+  );
+}
+
 function BrowserWindow({
   persona,
   index,
@@ -1541,7 +2247,7 @@ function BrowserWindow({
     ownerId: string;
     ownerName: string;
     origin: Network;
-    copyType: "promoted" | "demoted";
+    copyType: "promoted" | "demoted" | "shared";
     copyOutOfSync: boolean;
     differences: string[];
     promotionConflict: boolean;
@@ -1563,7 +2269,7 @@ function BrowserWindow({
     ownerId: string,
     editorUserId: string,
     requiresApproval: boolean,
-    copyType?: "promoted" | "demoted" | null,
+    copyType?: "promoted" | "demoted" | "shared" | null,
   ) => void;
   onStartLink: (itemId: string) => void;
 }) {
@@ -1575,7 +2281,7 @@ function BrowserWindow({
       moved: boolean;
       ownerId: string;
       requiresApproval: boolean;
-      copyType: "promoted" | "demoted" | null;
+      copyType: "promoted" | "demoted" | "shared" | null;
     } | null
   >(null);
   const suppressClickRef = useRef<string | null>(null);
@@ -1583,6 +2289,7 @@ function BrowserWindow({
     ...persona.items.map((item) => ({
       item,
       isOffNetwork: false,
+      isSharedItem: false,
       canWrite: true,
       ownerId: persona.id,
       ownerName: persona.name,
@@ -1608,7 +2315,8 @@ function BrowserWindow({
         permission,
       }) => ({
         item,
-        isOffNetwork: true,
+        isOffNetwork: copyType !== "shared",
+        isSharedItem: copyType === "shared",
         canWrite: permission === "write",
         ownerId,
         ownerName,
@@ -1659,7 +2367,7 @@ function BrowserWindow({
     canWrite: boolean,
     ownerId: string,
     requiresApproval: boolean,
-    copyType: "promoted" | "demoted" | null,
+    copyType: "promoted" | "demoted" | "shared" | null,
   ) {
     if (!canWrite) return;
     const trackWidth = event.currentTarget.parentElement?.clientWidth ?? 1;
@@ -1752,7 +2460,7 @@ function BrowserWindow({
         </div>
         <div className="schedule-stats">
           <span>{persona.items.length} objects</span>
-          {sharedItems.length > 0 && <span>+{sharedItems.length} synced</span>}
+          {sharedItems.length > 0 && <span>+{sharedItems.length} shared</span>}
           <span>{persona.dependencies.length} links</span>
         </div>
       </div>
@@ -1813,6 +2521,7 @@ function BrowserWindow({
           {
             item,
             isOffNetwork,
+            isSharedItem,
             canWrite,
             ownerId,
             ownerName,
@@ -1825,13 +2534,17 @@ function BrowserWindow({
           },
         ) => (
           <div
-            className={`schedule-row ${isOffNetwork ? "off-network-row" : ""}`}
+            className={`schedule-row ${isOffNetwork ? "off-network-row" : ""} ${
+              isSharedItem ? "same-network-row" : ""
+            }`}
             key={`${ownerName}-${item.id}`}
           >
             <button
               className={`item-label depth-${item.depth} ${
                 linkingSource === item.id ? "is-source" : ""
-              } ${isOffNetwork ? "is-provenance" : ""}`}
+              } ${isOffNetwork ? "is-provenance" : ""} ${
+                isSharedItem ? "is-shared" : ""
+              }`}
               onClick={() => openItem(item.id, ownerId, canWrite)}
               title={!canWrite
                 ? READ_ONLY_REASON
@@ -1839,9 +2552,13 @@ function BrowserWindow({
                 ? copyType === "demoted"
                   ? `Synced copy approved for release · Owned by ${ownerName}`
                   : `Synced copy promoted from ${origin} · Owned by ${ownerName}`
+                : isSharedItem
+                ? `Shared by ${ownerName} on ${origin}`
                 : undefined}
             >
-              {isOffNetwork
+              {isSharedItem
+                ? <Users size={11} className="shared-item-icon" />
+                : isOffNetwork
                 ? copyType === "demoted"
                   ? <BadgeCheck size={12} className="provenance-icon release" />
                   : <RefreshCw size={11} className="provenance-icon" />
@@ -1851,10 +2568,14 @@ function BrowserWindow({
                 ? <ChevronRight size={12} />
                 : <span className="branch-glyph">└</span>}
               <span>{item.name}</span>
-              {(isOffNetwork || (item.pendingApprovals?.length ?? 0) > 0 ||
-                item.demotionOutOfSync || copyOutOfSync ||
+              {(isOffNetwork || isSharedItem ||
+                (item.pendingApprovals?.length ?? 0) > 0 ||
+                (item.demotionOutOfSync && !isSharedItem) || copyOutOfSync ||
                 promotionConflict) && (
                 <div className="row-statuses">
+                  {isSharedItem && (
+                    <small className="sync-copy-chip shared">Shared</small>
+                  )}
                   {isOffNetwork && (
                     <small
                       className={`sync-copy-chip ${
@@ -1875,7 +2596,8 @@ function BrowserWindow({
                       {item.pendingApprovals!.length}
                     </span>
                   )}
-                  {(item.demotionOutOfSync || copyOutOfSync) && (
+                  {((item.demotionOutOfSync && !isSharedItem) ||
+                    copyOutOfSync) && (
                     <span
                       className="out-of-sync-icon"
                       title={copyOutOfSync
@@ -2081,6 +2803,7 @@ function AccessModal({
   onResolveSyncConflict,
   onReconcilePromotion,
   onSyncToDemotedState,
+  onResetLocalDemotedCopy,
   onUpdateCopy,
   onUpdate,
 }: {
@@ -2093,6 +2816,7 @@ function AccessModal({
   onResolveSyncConflict: (resolution: "source" | "local") => void;
   onReconcilePromotion: (stateId: string | "local") => void;
   onSyncToDemotedState: () => void;
+  onResetLocalDemotedCopy: () => void;
   onUpdateCopy: (patch: Partial<PromotedCopySnapshot>) => void;
   onUpdate: (patch: Partial<ScheduleItem>) => void;
 }) {
@@ -2100,6 +2824,9 @@ function AccessModal({
   const [showPeoplePicker, setShowPeoplePicker] = useState(false);
   const [selectedPeople, setSelectedPeople] = useState<string[]>([]);
   const originLevel = NETWORKS.indexOf(owner.network);
+  const isCrossNetworkView = Boolean(
+    viewingUser && viewingUser.network !== owner.network,
+  );
   const isReleasedCopy = Boolean(
     viewingUser &&
       NETWORKS.indexOf(viewingUser.network) < originLevel &&
@@ -2112,14 +2839,26 @@ function AccessModal({
   const promotedCopy = viewingUser && !isReleasedCopy
     ? item.promotedCopies?.[viewingUser.id]
     : undefined;
+  const localDemotedCopy = viewingUser &&
+      isReleasedCopy &&
+      item.promotedCopies?.[viewingUser.id]?.copyKind === "demoted"
+    ? item.promotedCopies[viewingUser.id]
+    : undefined;
   const hasPromotionStateConflict = promotionCandidates.length > 1 &&
+    promotionCandidatesConflict(promotionCandidates) &&
     promotedCopy?.reconciledCandidateSignature !==
       promotionCandidateSignature(promotionCandidates);
+  const showPromotedCopyOutOfSync = Boolean(
+    promotedCopy?.outOfSync &&
+      promotedCopyDiffersFromSources(promotedCopy, promotionCandidates),
+  );
   const differentLowerStates = promotedCopy
-    ? promotionCandidates.filter((candidate) =>
-      candidate.start !== promotedCopy.start ||
-      candidate.duration !== promotedCopy.duration
-    )
+    ? promotionCandidates.length > 1
+      ? promotionCandidates
+      : promotionCandidates.filter((candidate) =>
+        candidate.start !== promotedCopy.start ||
+        candidate.duration !== promotedCopy.duration
+      )
     : [];
   const isPromotedCopyView = Boolean(
     viewingUser && !isReleasedCopy && promotionCandidates.length > 0,
@@ -2159,14 +2898,44 @@ function AccessModal({
       }
       entries.push({ persona, label });
     };
-    addEntry(owner, "Source Owner");
-    promotionCandidates.forEach((candidate) => {
-      const holder = personas.find((persona) =>
-        persona.id === candidate.holderUserId
-      );
-      if (holder && holder.id !== owner.id) {
-        addEntry(holder, `${holder.network} owner`);
+    const hasActiveEdge = (parentId: string, childId: string) => {
+      if (parentId === owner.id) {
+        return item.promotion &&
+          item.access.some((entry) =>
+            entry.userId === childId && entry.permission !== "none"
+          );
       }
+      const parentCopy = item.promotedCopies?.[parentId];
+      return Boolean(
+        parentCopy?.promotion &&
+          parentCopy.access?.some((entry) =>
+            entry.userId === childId && entry.permission !== "none"
+          ),
+      );
+    };
+    const addLineage = (holderUserId: string) => {
+      const visited = new Set<string>();
+      let currentId: string | undefined = holderUserId;
+      while (currentId && !visited.has(currentId)) {
+        visited.add(currentId);
+        const current = personas.find((persona) => persona.id === currentId);
+        if (current) {
+          addEntry(
+            current,
+            current.id === owner.id
+              ? "Source Owner"
+              : `${current.network} owner`,
+          );
+        }
+        if (currentId === owner.id) break;
+        const parentId: string | undefined = item.promotedCopies?.[currentId]
+          ?.promotedFromUserId;
+        if (!parentId || !hasActiveEdge(parentId, currentId)) break;
+        currentId = parentId;
+      }
+    };
+    promotionCandidates.forEach((candidate) => {
+      addLineage(candidate.holderUserId);
     });
     return entries;
   })();
@@ -2176,10 +2945,12 @@ function AccessModal({
     ),
   );
   const displayedSyncTime = isReleasedCopy
-    ? item.demotedSnapshot?.lastSyncedAt ?? item.lastSyncedAt
+    ? localDemotedCopy?.lastSyncedAt ??
+      item.demotedSnapshot?.lastSyncedAt ??
+      item.lastSyncedAt
     : promotedCopy?.lastSyncedAt ?? item.lastSyncedAt;
   const visibleApprovals = (item.pendingApprovals ?? []).filter((request) =>
-    !isHighSideOnlyRequest(request, item, owner, personas) &&
+    !isCrossNetworkApprovalRequest(request, owner, personas) &&
     (!viewingUser || request.editorUserId === viewingUser.id)
   );
   const destinations = NETWORKS.filter((_, index) => index < originLevel);
@@ -2218,6 +2989,7 @@ function AccessModal({
         inherited?.lastSyncedAt ??
         item.lastSyncedAt ??
         new Date().toISOString(),
+      promotion: promotedCopy?.promotion ?? true,
       promotedFromUserId: promotedCopy?.promotedFromUserId ??
         inherited?.holderUserId,
       ...patch,
@@ -2288,9 +3060,13 @@ function AccessModal({
       kind === "promotion" ? index > originLevel : index < originLevel
     );
     onUpdate({
-      promotion: kind === "promotion" ? enabled : false,
-      demotion: kind === "demotion" ? enabled : false,
-      destination: valid[0] ?? owner.network,
+      promotion: kind === "promotion" ? enabled : item.promotion,
+      demotion: kind === "demotion" ? enabled : item.demotion,
+      destination: kind === "demotion" && enabled
+        ? valid.includes(item.destination)
+          ? item.destination
+          : valid.at(-1) ?? owner.network
+        : item.destination,
     });
   }
 
@@ -2319,7 +3095,7 @@ function AccessModal({
             </div>
           </div>
         )}
-        {viewingUser && (
+        {viewingUser && (isReleasedCopy || isPromotedCopyView) && (
           <>
             <div className="provenance-banner">
               {isReleasedCopy
@@ -2366,8 +3142,43 @@ function AccessModal({
             )}
           </>
         )}
+        {localDemotedCopy?.outOfSync && item.demotedSnapshot &&
+          (localDemotedCopy.start !== item.demotedSnapshot.start ||
+            localDemotedCopy.duration !== item.demotedSnapshot.duration) &&
+          (
+            <div className="out-of-sync-banner copy-divergence">
+              <TriangleAlert size={17} />
+              <div>
+                <strong>This released copy has local changes</strong>
+                <span>
+                  Your edits remain on this network. They were not promoted or
+                  sent to the source network.
+                </span>
+                <ul>
+                  {localDemotedCopy.differences.map((difference) => (
+                    <li key={difference}>{difference}</li>
+                  ))}
+                </ul>
+                <div
+                  className="conflict-actions"
+                  title={isReadOnly ? READ_ONLY_REASON : undefined}
+                >
+                  <button
+                    disabled={isReadOnly}
+                    title={isReadOnly ? READ_ONLY_REASON : undefined}
+                    onClick={onResetLocalDemotedCopy}
+                  >
+                    <RefreshCw size={11} /> Sync to approved release
+                  </button>
+                  <span className="keep-state-note">
+                    Current local state is retained
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
         {isPromotedCopyView && hasPromotionStateConflict &&
-          !promotedCopy?.outOfSync && (
+          !showPromotedCopyOutOfSync && (
           <div className="promotion-state-conflict">
             <div className="promotion-conflict-heading">
               <TriangleAlert size={17} />
@@ -2413,7 +3224,7 @@ function AccessModal({
             </button>
           </div>
         )}
-        {promotedCopy?.outOfSync && (
+        {showPromotedCopyOutOfSync && promotedCopy && (
           <div className="out-of-sync-banner copy-divergence">
             <TriangleAlert size={17} />
             <div>
@@ -2481,49 +3292,53 @@ function AccessModal({
             </div>
           </div>
         )}
-        {item.demotionOutOfSync && !isReleasedCopy && (
-          <div className="out-of-sync-banner">
-            <TriangleAlert size={17} />
-            <div>
-              <strong>Lower-network copy is out of sync</strong>
-              <span>
-                Demotion is off, so recent changes were not released to lower
-                networks. Enable demotion to synchronize the approved copy.
-              </span>
-              {item.demotedSnapshot && (
-                <>
-                  <strong className="version-list-title">
-                    Available lower-network version
-                  </strong>
-                  <div className="promotion-state-list embedded">
-                    <div className="promotion-state-option">
-                      <div>
-                        <strong>{item.destination} released state</strong>
-                        <span>
-                          Approved copy · Starts at{" "}
-                          {Math.round(item.demotedSnapshot.start)}% ·{" "}
-                          {Math.round(item.demotedSnapshot.duration / 4)}w ·
-                          Updated{" "}
-                          {formatSyncTime(item.demotedSnapshot.lastSyncedAt)}
-                        </span>
+        {item.demotionOutOfSync && !isReleasedCopy &&
+          (!viewingUser ||
+            NETWORKS.indexOf(viewingUser.network) !== originLevel) &&
+          (
+            <div className="out-of-sync-banner">
+              <TriangleAlert size={17} />
+              <div>
+                <strong>Lower-network copy is out of sync</strong>
+                <span>
+                  Demotion is off, so recent changes were not released to lower
+                  networks. Enable demotion to synchronize the approved copy.
+                </span>
+                {item.demotedSnapshot && (
+                  <>
+                    <strong className="version-list-title">
+                      Available lower-network version
+                    </strong>
+                    <div className="promotion-state-list embedded">
+                      <div className="promotion-state-option">
+                        <div>
+                          <strong>{item.destination} released state</strong>
+                          <span>
+                            Approved copy · Starts at{" "}
+                            {Math.round(item.demotedSnapshot.start)}% ·{" "}
+                            {Math.round(item.demotedSnapshot.duration / 4)}w ·
+                            Updated{" "}
+                            {formatSyncTime(item.demotedSnapshot.lastSyncedAt)}
+                          </span>
+                        </div>
+                        <button
+                          disabled={Boolean(viewingUser)}
+                          title={viewingUser
+                            ? OWNER_ONLY_DEMOTION_REASON
+                            : undefined}
+                          onClick={onSyncToDemotedState}
+                        >
+                          Sync to this state
+                        </button>
                       </div>
-                      <button
-                        disabled={Boolean(viewingUser)}
-                        title={viewingUser
-                          ? OWNER_ONLY_DEMOTION_REASON
-                          : undefined}
-                        onClick={onSyncToDemotedState}
-                      >
-                        Sync to this state
-                      </button>
                     </div>
-                  </div>
-                </>
-              )}
+                  </>
+                )}
+              </div>
             </div>
-          </div>
-        )}
-        {(item.approvals || visibleApprovals.length > 0) && (
+          )}
+        {((item.approvals && !isCrossNetworkView) ||
+          visibleApprovals.length > 0) && (
           <section className="control-section approval-queue">
             <div className="section-heading">
               <div>
@@ -2798,41 +3613,44 @@ function AccessModal({
           </div>
         </section>
 
-        <section
-          className={`control-section policy ${
-            viewingUser ? "permission-locked" : ""
-          }`}
-          title={viewingUser
-            ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_APPROVAL_REASON
-            : undefined}
-        >
-          <div className="section-heading">
-            <div>
-              <ShieldCheck size={17} />
+        {!isCrossNetworkView && (
+          <section
+            className={`control-section policy ${
+              viewingUser ? "permission-locked" : ""
+            }`}
+            title={viewingUser
+              ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_APPROVAL_REASON
+              : undefined}
+          >
+            <div className="section-heading">
               <div>
-                <strong>Owner approvals</strong>
-                <span>
-                  Route editor changes to the owner before publishing.
-                </span>
+                <ShieldCheck size={17} />
+                <div>
+                  <strong>Owner approvals</strong>
+                  <span>
+                    Review same-network editor changes before they update this
+                    state.
+                  </span>
+                </div>
               </div>
+              <Toggle
+                label="Owner approvals"
+                disabled={Boolean(viewingUser)}
+                disabledReason={isReadOnly
+                  ? READ_ONLY_REASON
+                  : OWNER_ONLY_APPROVAL_REASON}
+                checked={item.approvals}
+                onChange={(approvals) =>
+                  !viewingUser &&
+                  onUpdate({
+                    approvals,
+                    promotion: item.promotion,
+                    demotion: approvals ? item.demotion : false,
+                  })}
+              />
             </div>
-            <Toggle
-              label="Owner approvals"
-              disabled={Boolean(viewingUser)}
-              disabledReason={isReadOnly
-                ? READ_ONLY_REASON
-                : OWNER_ONLY_APPROVAL_REASON}
-              checked={item.approvals}
-              onChange={(approvals) =>
-                !viewingUser &&
-                onUpdate({
-                  approvals,
-                  promotion: item.promotion,
-                  demotion: approvals ? item.demotion : false,
-                })}
-            />
-          </div>
-        </section>
+          </section>
+        )}
 
         <section
           className={`control-section policy ${
@@ -2917,7 +3735,19 @@ function AccessModal({
             </small>
           </label>
         )}
-        {!item.approvals && (
+        {!viewingUser && item.promotion && item.demotion && (
+          <div className="dual-sharing-callout">
+            <GitBranch size={16} />
+            <div>
+              <strong>Bidirectional distribution is active</strong>
+              <span>
+                Live synced copies can move up-network while the approved
+                snapshot is released to {item.destination}.
+              </span>
+            </div>
+          </div>
+        )}
+        {!item.approvals && !viewingUser && (
           <div className="info-callout">
             <LockKeyhole size={15} />{" "}
             Turn on owner approvals to enable demotion.

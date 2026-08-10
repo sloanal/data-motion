@@ -30,16 +30,22 @@ These rules take precedence when features conflict:
 1. A lower network must never learn about an unreleased higher-network change.
 2. Promotion does not require approvals.
 3. Demotion requires owner approvals.
-4. Promotion creates higher-network synced copies, not shared live objects.
-5. Demotion creates an approved snapshot on one selected lower network.
-6. Disabling demotion stops all subsequent downward propagation.
-7. A higher-network edit with demotion disabled remains local and creates no
-   low-side approval request or alert.
-8. Approved changes apply atomically to every item in the rigid dependency
-   group.
-9. Denied changes must not alter dates, dependencies, sync timestamps, or
-   receiving copies.
-10. Read-only users may inspect an item but may not move it or create
+4. Approval requests apply only to editors changing a state on the same network
+   as that state's owner.
+5. Cross-network edits create local divergence and reconciliation choices, never
+   approval requests.
+6. Promotion creates higher-network synced copies, not shared live objects.
+7. Demotion creates an approved snapshot on one selected lower network.
+8. Promotion and demotion may be active simultaneously and follow their
+   independent policy requirements.
+9. Disabling demotion stops all subsequent downward propagation.
+10. A higher-network edit with demotion disabled remains local and creates no
+    low-side approval request or alert.
+11. Approved changes apply atomically to every item in the rigid dependency
+    group.
+12. Denied changes must not alter dates, dependencies, sync timestamps, or
+    receiving copies.
+13. Read-only users may inspect an item but may not move it or create
     dependencies.
 
 ## Baseline setup
@@ -149,6 +155,42 @@ Expected:
   disappear from the receiving share modal.
 - If another valid promotion path remains, only that path's owners stay visible.
 
+### QA-PERM-04 — Same-network sharing
+
+1. Configure two users on NIPR.
+2. Add the second user to a NIPR-owned item as **Viewer**.
+3. Keep promotion and demotion off.
+
+Expected:
+
+- The item appears in both NIPR accounts.
+- The receiving row is labeled **Shared**, not promoted or released.
+- No provenance, conflict, or out-of-sync warning is shown.
+- The Viewer can inspect the item but cannot edit dates or dependencies.
+
+### QA-PERM-05 — Same-network editor with approvals
+
+1. Change the receiving NIPR user to **Editor**.
+2. Enable owner approvals on the item.
+3. Move the item or create a dependency from the receiving account.
+
+Expected:
+
+- The proposed change does not apply immediately.
+- The Editor sees **Awaiting owner**.
+- The source owner receives the approval request and pending row indicator.
+- Approving applies the change in both accounts.
+- Denying leaves both accounts unchanged.
+
+### QA-PERM-06 — Same-network editor without approvals
+
+Repeat QA-PERM-05 with owner approvals off.
+
+Expected:
+
+- Date and dependency changes apply immediately in both same-network accounts.
+- No approval request or network-sync warning is created.
+
 ## Promotion
 
 ### QA-PROMO-01 — Promotion without approvals
@@ -237,26 +279,33 @@ Expected:
 
 - The SIPR access list and promotion controls belong to the SIPR copy state, not
   the NIPR origin.
+- Adding the first onward collaborator initializes that copy as an active
+  promoted state, so the recipient appears without requiring a second hidden
+  save step.
 - The collaborator list shows a **Source Owner** pill beside the origin user and
   a network-owner pill beside each intermediary, for example, **NIPR owner**
   beside Eli.
 - Lower-network lineage owners remain visible without being duplicated in the
   add-people picker.
-- The JWICS user receives the SIPR dates, including its out-of-sync state.
+- The JWICS user receives the SIPR dates and is considered synchronized to that
+  immediate source, even though SIPR differs from the NIPR origin.
 - The JWICS copy identifies SIPR as its immediate promotion source.
 - The NIPR origin remains unchanged and unaware of the SIPR edit.
 
 ### QA-PROMO-08 — Multi-hop updates
 
-Continue from QA-PROMO-07 and move the SIPR copy again.
+1. Continue from QA-PROMO-07 and move the SIPR copy again.
+2. Then explicitly edit the JWICS copy.
+3. Move the SIPR copy one more time.
 
 Expected:
 
-- Because the JWICS copy is already out of sync, its Gantt bar does not move
-  automatically.
-- Its modal lists the newly updated SIPR state as an available lower-network
-  version.
-- The SIPR row includes a **Sync to this state** action.
+- Before the JWICS edit, its bar follows every promoted SIPR change.
+- The inherited NIPR/SIPR disagreement does not mark JWICS as locally out of
+  sync.
+- After the explicit JWICS edit, later SIPR changes do not move JWICS.
+- The JWICS modal instead lists the updated SIPR version with a **Sync to this
+  state** action.
 - No approval request or alert appears on NIPR.
 
 ### QA-PROMO-09 — Conflicting direct and inherited promotion states
@@ -273,6 +322,35 @@ Expected:
   time.
 - Each candidate has a **Sync to this state** action.
 - No candidate is silently allowed to overwrite the other.
+
+### QA-PROMO-09A — Direct and chained owners on the receiving copy
+
+1. Have Eli on NIPR share directly with Nia on SIPR and Owen on JWICS.
+2. Give Nia Editor access.
+3. From Nia's SIPR copy, share the same item directly with Owen.
+4. Make the NIPR and SIPR states differ.
+
+Expected:
+
+- Owen's access list shows Eli with a **Source Owner** pill.
+- The same list shows Nia with a **SIPR owner** pill.
+- Owen's out-of-sync alert lists both NIPR and SIPR state options.
+- Each option has its own **Sync to this state** action.
+- This behavior repeats through additional active promotion hops.
+- Removing any upstream access edge removes that owner and state option while
+  preserving other valid paths.
+
+### QA-PROMO-09B — Matching multi-source states
+
+1. Share the same item to Owen through both Eli and Nia.
+2. Keep the NIPR, SIPR, and JWICS schedule states identical.
+
+Expected:
+
+- Eli and Nia remain visible in Owen's access lineage.
+- Owen does not see a conflicting-state or out-of-sync alert.
+- No reconciliation action is required until at least one incoming schedule
+  state differs from Owen's current state.
 
 ### QA-PROMO-10 — Reconcile promotion states
 
@@ -384,6 +462,37 @@ Expected:
 - The higher-side out-of-sync warning clears.
 - **Last synced** updates on the receiving copy.
 
+### QA-DEMOTE-07 — Simultaneous promotion and demotion
+
+1. Use a SIPR-owned object with approvals enabled.
+2. Enable promotion and share with a JWICS user.
+3. Enable demotion and select NIPR as the destination.
+
+Expected:
+
+- Both toggles remain on.
+- The modal displays the bidirectional-distribution message.
+- JWICS receives a promoted synced copy.
+- NIPR receives the approved demoted snapshot.
+- Turning either direction off leaves the other direction unchanged.
+- Turning approvals off disables demotion but preserves promotion.
+- Exporting and importing the scenario preserves both enabled values when all
+  network and approval conditions remain valid.
+
+### QA-DEMOTE-08 — Lower-network editor changes a released copy
+
+1. Demote an approved SIPR snapshot to a NIPR Editor.
+2. Move the released copy or add a local dependency from NIPR.
+
+Expected:
+
+- The NIPR change applies only to that local released-copy state.
+- No approval request is sent to SIPR.
+- The SIPR source and other receiving networks remain unchanged.
+- NIPR sees a local out-of-sync alert without source-network details.
+- The NIPR state owner can keep the local state or sync back to the approved
+  release.
+
 ## Editing and rigid dependencies
 
 ### QA-EDIT-01 — Drag an unconnected item
@@ -433,7 +542,7 @@ Expected:
 
 ### QA-APPROVAL-01 — Editor submits a governed date change
 
-Use a writable governed copy where the change is allowed to route to its owner.
+Use an Editor and owner on the same network with local owner approvals enabled.
 
 Expected:
 
@@ -497,6 +606,18 @@ Expected:
 - No pending icon or request count appears on the low side.
 - Imported legacy requests with this invalid direction are converted into
   high-side divergence state.
+
+### QA-APPROVAL-07 — Cross-network edits never request approval
+
+Test an Editor on a promoted higher-network copy and an Editor on a demoted
+lower-network copy while source approvals are enabled.
+
+Expected:
+
+- Neither edit creates an approval request on another network.
+- Each edit changes only the Editor's local network state.
+- Each edited copy becomes out of sync and exposes reconciliation actions to its
+  state owner.
 
 ## Sync conflicts
 
@@ -627,6 +748,60 @@ Expected:
 - At most six browsers are imported.
 - Invalid JSON produces the Data Motion validation message without changing
   current state.
+
+## Behavioral rulebook
+
+### QA-RULES-01 — Open the system rules
+
+1. Select **Rules** from the application header.
+2. Copy and reload the URL containing `#rules`.
+
+Expected:
+
+- The page explains same-network sharing, promotion, demotion, divergence,
+  approvals, and multi-source reconciliation.
+- The network hierarchy and directional meanings are visually clear.
+- Hard boundaries match the non-negotiable invariants in this document.
+- Reloading the hash URL returns directly to the rulebook.
+
+### QA-RULES-02 — Open the executable specification
+
+1. Follow the **Open QA_SCENARIOS.md** action.
+2. Load the linked document into an LLM.
+3. Ask which users, states, approvals, and alerts apply to a sample scenario.
+
+Expected:
+
+- The link opens the repository's current QA scenario document.
+- The rulebook clearly explains that the file can be used for LLM-assisted
+  behavioral questions.
+- Navigation returns to both the sandbox and changelog without losing scenario
+  state.
+
+## Changelog
+
+### QA-CHANGELOG-01 — Open release history
+
+1. Select **Changelog** from the application header.
+2. Copy and reload the URL containing `#changelog`.
+
+Expected:
+
+- The dedicated changelog page opens.
+- Releases are ordered newest first with version, date, summary, categories, and
+  detailed changes.
+- The newest release is visibly marked **Latest**.
+- Reloading the hash URL returns directly to the changelog.
+
+### QA-CHANGELOG-02 — Return to the sandbox
+
+1. Select **Back to sandbox** or the header **Sandbox** action.
+
+Expected:
+
+- The schedule workspace returns without losing scenario state.
+- The URL hash is removed.
+- Reset, import, and export controls are available only in the sandbox view.
 
 ## Cross-feature regression checklist
 
