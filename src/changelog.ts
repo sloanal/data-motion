@@ -9,6 +9,23 @@ export type ChangelogEntry = {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.7.0",
+    date: "2026-08-27",
+    title: "Demotion release authorities",
+    summary:
+      "Added a dedicated approval authority for every down-network release path.",
+    changes: [
+      "Added one Demotion Approval Authority persona on each high-side network.",
+      "Blocked first-time demotion until a same-network authority is assigned.",
+      "Shared newly governed items with the authority without creating an initial approval request.",
+      "Routed every later source schedule and dependency change through the assigned authority.",
+      "Added authority-specific item visibility, pending badges, and approval actions.",
+      "Added a browser-session picker for opening hidden authority accounts.",
+      "Updated scenario schema normalization for authority assignments and pending releases.",
+    ],
+    categories: ["Demotion", "Approvals", "Governance"],
+  },
+  {
     version: "0.6.0",
     date: "2026-08-10",
     title: "Flexible sharing across every network direction",

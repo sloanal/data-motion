@@ -60,6 +60,17 @@ type ApprovalRequest = {
   submittedAt: string;
 };
 
+type DemotionApprovalRequest = {
+  id: string;
+  kind: "enable" | "schedule" | "dependency";
+  submittedByUserId: string;
+  submittedAt: string;
+  requestedStart?: number;
+  dependency?: [string, string];
+  dependencyPersonaId?: string;
+  clearsDemotionOutOfSync?: boolean;
+};
+
 type DemotedSnapshot = {
   start: number;
   duration: number;
@@ -108,6 +119,9 @@ type ScheduleItem = DistributionPolicy & {
   access: Access[];
   lastSyncedAt?: string;
   pendingApprovals?: ApprovalRequest[];
+  pendingDemotionApprovals?: DemotionApprovalRequest[];
+  demotionAuthorityUserId?: string;
+  demotionRequested?: boolean;
   demotedSnapshot?: DemotedSnapshot;
   demotionOutOfSync?: boolean;
   promotedCopies?: Record<string, PromotedCopySnapshot>;
@@ -122,6 +136,8 @@ type Persona = {
   accent: string;
   items: ScheduleItem[];
   dependencies: [string, string][];
+  personaKind?: "standard" | "demotion-authority";
+  isOpen?: boolean;
 };
 
 type Modal =
@@ -167,6 +183,37 @@ const ROLES = [
   "Systems planner",
   "Mission owner",
   "Contractor lead",
+];
+const AUTHORITY_PROFILES: {
+  id: string;
+  name: string;
+  network: Exclude<Network, "Commercial">;
+  accent: string;
+}[] = [
+  {
+    id: "authority-nipr",
+    name: "Dana Mercer",
+    network: "NIPR",
+    accent: "#8bc7f2",
+  },
+  {
+    id: "authority-sipr",
+    name: "Marcus Hale",
+    network: "SIPR",
+    accent: "#e9c764",
+  },
+  {
+    id: "authority-jwics",
+    name: "Tessa Ward",
+    network: "JWICS",
+    accent: "#e8957e",
+  },
+  {
+    id: "authority-sap",
+    name: "Adrian Knox",
+    network: "SAP",
+    accent: "#d2a0ee",
+  },
 ];
 const PROJECT_SETS = [
   [
@@ -246,8 +293,23 @@ function makeItems(index: number): ScheduleItem[] {
   }));
 }
 
+function createAuthorityPersonas(): Persona[] {
+  return AUTHORITY_PROFILES.map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    role: "Demotion Approval Authority",
+    organization: "Network Release Authority",
+    network: profile.network,
+    accent: profile.accent,
+    items: [],
+    dependencies: [],
+    personaKind: "demotion-authority",
+    isOpen: false,
+  }));
+}
+
 function createDefaultPersonas(): Persona[] {
-  return NAMES.slice(0, 4).map((name, index) => ({
+  const standardPersonas: Persona[] = NAMES.slice(0, 4).map((name, index) => ({
     id: `user-${index}`,
     name,
     role: ROLES[index],
@@ -257,6 +319,8 @@ function createDefaultPersonas(): Persona[] {
     items: makeItems(index),
     dependencies: [[`u${index}-p2`, `u${index}-p4`]],
   }));
+  const authorityPersonas = createAuthorityPersonas();
+  return [...standardPersonas, ...authorityPersonas];
 }
 
 const NETWORK_IDS: Record<Network, string> = {
@@ -589,19 +653,55 @@ function normalizeApprovalBoundaries(personas: Persona[]) {
 }
 
 function normalizePersistedState(personas: Persona[]) {
-  return normalizeApprovalBoundaries(personas).map((owner) => ({
+  const withAuthorities = [
+    ...personas,
+    ...createAuthorityPersonas().filter((authority) =>
+      !personas.some((persona) => persona.id === authority.id)
+    ),
+  ];
+  return normalizeApprovalBoundaries(withAuthorities).map((owner) => ({
     ...owner,
     items: owner.items.map((item) => {
       const ownerLevel = NETWORKS.indexOf(owner.network);
       const validDemotionDestinations = NETWORKS.filter((_, index) =>
         index < ownerLevel
       );
+      const assignedAuthority = withAuthorities.find((persona) =>
+        persona.id === item.demotionAuthorityUserId &&
+        persona.personaKind === "demotion-authority" &&
+        persona.network === owner.network
+      );
+      const hasLegacyEnableRequest = Boolean(
+        assignedAuthority &&
+          item.pendingDemotionApprovals?.some((request) =>
+            request.kind === "enable"
+          ),
+      );
+      const demotionEnabled = ownerLevel > 0 &&
+        Boolean(
+          item.approvals &&
+            assignedAuthority &&
+            (item.demotion || hasLegacyEnableRequest),
+        );
       const normalizedItem: ScheduleItem = {
         ...item,
         promotion: ownerLevel < NETWORKS.length - 1 &&
           Boolean(item.promotion),
-        demotion: ownerLevel > 0 &&
-          Boolean(item.approvals && item.demotion),
+        demotion: demotionEnabled,
+        demotionAuthorityUserId: assignedAuthority?.id,
+        demotionRequested: false,
+        pendingDemotionApprovals: assignedAuthority
+          ? item.pendingDemotionApprovals?.filter((request) =>
+            request.kind !== "enable"
+          )
+          : [],
+        demotedSnapshot: demotionEnabled
+          ? item.demotedSnapshot ?? {
+            start: item.start,
+            duration: item.duration,
+            lastSyncedAt: new Date().toISOString(),
+          }
+          : item.demotedSnapshot,
         destination: validDemotionDestinations.includes(item.destination)
           ? item.destination
           : validDemotionDestinations.at(-1) ?? owner.network,
@@ -631,7 +731,7 @@ function normalizePersistedState(personas: Persona[]) {
 
 const DEFAULTS = createDefaultPersonas();
 const STORAGE_KEY = "relay-sandbox-v1";
-const SCENARIO_SCHEMA_VERSION = 2;
+const SCENARIO_SCHEMA_VERSION = 3;
 
 function Toggle({
   checked,
@@ -683,7 +783,10 @@ function App() {
       ? "rules"
       : "sandbox"
   );
+  const [showSessionPicker, setShowSessionPicker] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const openPersonas = personas.filter((persona) => persona.isOpen !== false);
+  const closedPersonas = personas.filter((persona) => persona.isOpen === false);
 
   useEffect(() => {
     const handleHashChange = () => {
@@ -844,7 +947,7 @@ function App() {
     ownerId: string,
     editorUserId: string,
     requiresApproval: boolean,
-    copyType?: "promoted" | "demoted" | "shared" | null,
+    copyType?: "promoted" | "demoted" | "shared" | "authority" | null,
   ) {
     setPersonas((current) => {
       const sourceOwner = current.find((persona) => persona.id === ownerId);
@@ -1047,6 +1150,51 @@ function App() {
             : persona
         );
       }
+      if (
+        sourceItem?.demotion &&
+        sourceItem.demotionAuthorityUserId &&
+        !isCrossNetworkEdit
+      ) {
+        return current.map((persona) =>
+          persona.id === ownerId
+            ? {
+              ...persona,
+              items: persona.items.map((item) => {
+                if (item.id !== itemId) return item;
+                const requests = item.pendingDemotionApprovals ?? [];
+                const existing = requests.find((request) =>
+                  request.kind === "schedule" &&
+                  request.submittedByUserId === editorUserId
+                );
+                const requestedStart = Math.max(
+                  0,
+                  Math.min(
+                    100 - item.duration,
+                    (existing?.requestedStart ?? item.start) + requestedDelta,
+                  ),
+                );
+                return {
+                  ...item,
+                  pendingDemotionApprovals: [
+                    ...requests.filter((request) =>
+                      request.id !== existing?.id
+                    ),
+                    {
+                      id: existing?.id ??
+                        `demotion-schedule-${editorUserId}-${itemId}-${Date.now()}`,
+                      kind: "schedule",
+                      submittedByUserId: editorUserId,
+                      submittedAt: existing?.submittedAt ??
+                        new Date().toISOString(),
+                      requestedStart: Math.round(requestedStart * 10) / 10,
+                    },
+                  ],
+                };
+              }),
+            }
+            : persona
+        );
+      }
       return shiftConnectedItems(current, itemId, requestedDelta);
     });
   }
@@ -1082,26 +1230,210 @@ function App() {
           }
           : persona
       );
-      return approved
-        ? request.kind === "dependency" && request.dependency &&
-            request.dependencyPersonaId
-          ? withoutRequest.map((persona) =>
-            persona.id === request.dependencyPersonaId
-              ? {
-                ...persona,
-                dependencies: [
-                  ...persona.dependencies,
-                  request.dependency!,
-                ],
-              }
-              : persona
-          )
-          : shiftConnectedItems(
-            withoutRequest,
-            itemId,
-            (request.requestedStart ?? item.start) - item.start,
-          )
-        : withoutRequest;
+      if (!approved) return withoutRequest;
+      if (item.demotion && item.demotionAuthorityUserId) {
+        return withoutRequest.map((persona) =>
+          persona.id === ownerId
+            ? {
+              ...persona,
+              items: persona.items.map((entry) =>
+                entry.id === itemId
+                  ? {
+                    ...entry,
+                    pendingDemotionApprovals: [
+                      ...(entry.pendingDemotionApprovals ?? []),
+                      {
+                        id: `demotion-${
+                          request.kind ?? "schedule"
+                        }-${request.id}`,
+                        kind: request.kind === "dependency"
+                          ? "dependency"
+                          : "schedule",
+                        submittedByUserId: ownerId,
+                        submittedAt: new Date().toISOString(),
+                        requestedStart: request.requestedStart,
+                        dependency: request.dependency,
+                        dependencyPersonaId: request.dependencyPersonaId,
+                      },
+                    ],
+                  }
+                  : entry
+              ),
+            }
+            : persona
+        );
+      }
+      return request.kind === "dependency" && request.dependency &&
+          request.dependencyPersonaId
+        ? withoutRequest.map((persona) =>
+          persona.id === request.dependencyPersonaId
+            ? {
+              ...persona,
+              dependencies: [
+                ...persona.dependencies,
+                request.dependency!,
+              ],
+            }
+            : persona
+        )
+        : shiftConnectedItems(
+          withoutRequest,
+          itemId,
+          (request.requestedStart ?? item.start) - item.start,
+        );
+    });
+  }
+
+  function setDemotionAuthority(
+    ownerId: string,
+    itemId: string,
+    authorityUserId: string,
+  ) {
+    setPersonas((current) =>
+      current.map((persona) =>
+        persona.id === ownerId
+          ? {
+            ...persona,
+            items: persona.items.map((item) =>
+              item.id === itemId
+                ? { ...item, demotionAuthorityUserId: authorityUserId }
+                : item
+            ),
+          }
+          : persona
+      )
+    );
+  }
+
+  function enableDemotion(
+    ownerId: string,
+    itemId: string,
+    authorityUserId: string,
+  ) {
+    setPersonas((current) => {
+      const syncedAt = new Date().toISOString();
+      return current.map((persona) =>
+        persona.id === ownerId
+          ? {
+            ...persona,
+            items: persona.items.map((item) =>
+              item.id === itemId
+                ? {
+                  ...item,
+                  demotionAuthorityUserId: authorityUserId,
+                  demotion: true,
+                  demotionRequested: false,
+                  pendingDemotionApprovals: item.pendingDemotionApprovals
+                    ?.filter(
+                      (request) => request.kind !== "enable",
+                    ),
+                  demotedSnapshot: {
+                    start: item.start,
+                    duration: item.duration,
+                    lastSyncedAt: syncedAt,
+                  },
+                }
+                : item
+            ),
+          }
+          : persona
+      );
+    });
+  }
+
+  function resolveDemotionApproval(
+    ownerId: string,
+    itemId: string,
+    requestId: string,
+    approved: boolean,
+  ) {
+    setPersonas((current) => {
+      const item = current
+        .find((persona) => persona.id === ownerId)
+        ?.items.find((entry) => entry.id === itemId);
+      const request = item?.pendingDemotionApprovals?.find((entry) =>
+        entry.id === requestId
+      );
+      if (!item || !request) return current;
+      const withoutRequest = current.map((persona) =>
+        persona.id === ownerId
+          ? {
+            ...persona,
+            items: persona.items.map((entry) =>
+              entry.id === itemId
+                ? {
+                  ...entry,
+                  demotionRequested: request.kind === "enable"
+                    ? false
+                    : entry.demotionRequested,
+                  pendingDemotionApprovals: entry.pendingDemotionApprovals
+                    ?.filter(
+                      (pending) => pending.id !== requestId,
+                    ),
+                }
+                : entry
+            ),
+          }
+          : persona
+      );
+      if (!approved) return withoutRequest;
+      if (request.kind === "enable") {
+        const syncedAt = new Date().toISOString();
+        return withoutRequest.map((persona) =>
+          persona.id === ownerId
+            ? {
+              ...persona,
+              items: persona.items.map((entry) =>
+                entry.id === itemId
+                  ? {
+                    ...entry,
+                    demotion: true,
+                    demotionRequested: false,
+                    demotedSnapshot: {
+                      start: entry.start,
+                      duration: entry.duration,
+                      lastSyncedAt: syncedAt,
+                    },
+                  }
+                  : entry
+              ),
+            }
+            : persona
+        );
+      }
+      if (
+        request.kind === "dependency" &&
+        request.dependency &&
+        request.dependencyPersonaId
+      ) {
+        return withoutRequest.map((persona) =>
+          persona.id === request.dependencyPersonaId
+            ? {
+              ...persona,
+              dependencies: [...persona.dependencies, request.dependency!],
+            }
+            : persona
+        );
+      }
+      const shifted = shiftConnectedItems(
+        withoutRequest,
+        itemId,
+        (request.requestedStart ?? item.start) - item.start,
+      );
+      return request.clearsDemotionOutOfSync
+        ? shifted.map((persona) =>
+          persona.id === ownerId
+            ? {
+              ...persona,
+              items: persona.items.map((entry) =>
+                entry.id === itemId
+                  ? { ...entry, demotionOutOfSync: false }
+                  : entry
+              ),
+            }
+            : persona
+        )
+        : shifted;
     });
   }
 
@@ -1241,6 +1573,33 @@ function App() {
         .find((persona) => persona.id === ownerId)
         ?.items.find((entry) => entry.id === itemId);
       if (!item?.demotedSnapshot) return current;
+      if (item.demotionAuthorityUserId) {
+        return current.map((persona) =>
+          persona.id === ownerId
+            ? {
+              ...persona,
+              items: persona.items.map((entry) =>
+                entry.id === itemId
+                  ? {
+                    ...entry,
+                    pendingDemotionApprovals: [
+                      ...(entry.pendingDemotionApprovals ?? []),
+                      {
+                        id: `demotion-reconcile-${itemId}-${Date.now()}`,
+                        kind: "schedule",
+                        submittedByUserId: ownerId,
+                        submittedAt: new Date().toISOString(),
+                        requestedStart: item.demotedSnapshot!.start,
+                        clearsDemotionOutOfSync: true,
+                      },
+                    ],
+                  }
+                  : entry
+              ),
+            }
+            : persona
+        );
+      }
       const shifted = shiftConnectedItems(
         current,
         itemId,
@@ -1291,12 +1650,21 @@ function App() {
     );
   }
 
-  function addPersona() {
-    if (personas.length >= 6) return;
+  function addPersona(userId?: string) {
+    if (openPersonas.length >= 6) return;
+    if (userId) {
+      setPersonas((current) =>
+        current.map((persona) =>
+          persona.id === userId ? { ...persona, isOpen: true } : persona
+        )
+      );
+      setShowSessionPicker(false);
+      return;
+    }
     const used = new Set(personas.map((p) => p.name));
     const index = NAMES.findIndex((name) => !used.has(name));
-    const templateIndex = index < 0 ? personas.length : index;
-    const nextIndex = Math.max(0, templateIndex);
+    if (index < 0) return;
+    const nextIndex = index;
     setPersonas((current) => [
       ...current,
       {
@@ -1311,12 +1679,19 @@ function App() {
           id: `${item.id}-${Date.now()}`,
         })),
         dependencies: [],
+        personaKind: "standard",
+        isOpen: true,
       },
     ]);
+    setShowSessionPicker(false);
   }
 
   function removePersona(id: string) {
-    setPersonas((current) => current.filter((persona) => persona.id !== id));
+    setPersonas((current) =>
+      current.map((persona) =>
+        persona.id === id ? { ...persona, isOpen: false } : persona
+      )
+    );
     setModal(null);
   }
 
@@ -1441,6 +1816,40 @@ function App() {
                     ],
                   };
                 }),
+              }
+              : persona
+          );
+        }
+
+        const governedLocalItem = viewer?.items.find((item) =>
+          (item.id === dependency[0] || item.id === dependency[1]) &&
+          item.demotion &&
+          item.demotionAuthorityUserId
+        );
+        if (governedLocalItem && viewer) {
+          return current.map((persona) =>
+            persona.id === viewer.id
+              ? {
+                ...persona,
+                items: persona.items.map((item) =>
+                  item.id === governedLocalItem.id
+                    ? {
+                      ...item,
+                      pendingDemotionApprovals: [
+                        ...(item.pendingDemotionApprovals ?? []),
+                        {
+                          id:
+                            `demotion-dependency-${viewingUserId}-${Date.now()}`,
+                          kind: "dependency",
+                          submittedByUserId: viewingUserId,
+                          submittedAt: new Date().toISOString(),
+                          dependency,
+                          dependencyPersonaId: viewingUserId,
+                        },
+                      ],
+                    }
+                    : item
+                ),
               }
               : persona
           );
@@ -1615,7 +2024,7 @@ function App() {
             <section className="intro">
               <div>
                 <div className="eyebrow">
-                  Scenario workspace · {personas.length}/6 sessions
+                  Scenario workspace · {openPersonas.length}/6 sessions
                 </div>
                 <h1>
                   See how work moves<br />across boundaries.
@@ -1646,7 +2055,7 @@ function App() {
             )}
 
             <section className="browser-grid">
-              {personas.map((persona, index) => (
+              {openPersonas.map((persona, index) => (
                 <BrowserWindow
                   key={persona.id}
                   persona={persona}
@@ -1668,6 +2077,8 @@ function App() {
                           Boolean(item.demotion || item.demotedSnapshot);
                         const isSameNetworkShare = hasOriginAccess &&
                           recipientLevel === sourceLevel;
+                        const isAuthorityAssignment =
+                          item.demotionAuthorityUserId === persona.id;
                         const promotionCandidates = getPromotionCandidates(
                           item,
                           source,
@@ -1678,7 +2089,8 @@ function App() {
                         if (
                           !isDemotedCopy &&
                           !isPromotedCopy &&
-                          !isSameNetworkShare
+                          !isSameNetworkShare &&
+                          !isAuthorityAssignment
                         ) {
                           return [];
                         }
@@ -1735,9 +2147,12 @@ function App() {
                             ? "demoted"
                             : isPromotedCopy
                             ? "promoted"
+                            : isAuthorityAssignment
+                            ? "authority"
                             : "shared") as
                               | "demoted"
                               | "promoted"
+                              | "authority"
                               | "shared",
                           copyOutOfSync: isDemotedCopy && localDemotedSnapshot
                             ? Boolean(
@@ -1769,7 +2184,9 @@ function App() {
                             promotedSnapshot?.reconciledCandidateSignature !==
                               promotionCandidateSignature(promotionCandidates),
                           promotionCandidates,
-                          permission: isPromotedCopy
+                          permission: isAuthorityAssignment
+                            ? "read" as Permission
+                            : isPromotedCopy
                             ? promotionCandidates.some((candidate) =>
                                 candidate.permission === "write"
                               )
@@ -1793,14 +2210,55 @@ function App() {
                     setLinking({ userId: persona.id, sourceId })}
                 />
               ))}
-              {personas.length < 6 && (
-                <button className="add-window" onClick={addPersona}>
-                  <span>
-                    <Plus size={22} />
-                  </span>
-                  <strong>Add browser window</strong>
-                  <small>Create another user perspective</small>
-                </button>
+              {openPersonas.length < 6 && (
+                <div className="add-window">
+                  <button
+                    className="add-window-trigger"
+                    onClick={() => setShowSessionPicker((current) => !current)}
+                  >
+                    <span>
+                      <Plus size={22} />
+                    </span>
+                    <strong>Add browser window</strong>
+                    <small>Open a user or approval-authority session</small>
+                  </button>
+                  {showSessionPicker && (
+                    <div className="session-picker">
+                      {closedPersonas.map((persona) => (
+                        <button
+                          key={persona.id}
+                          onClick={() => addPersona(persona.id)}
+                        >
+                          <div
+                            className="mini-avatar"
+                            style={{ background: persona.accent }}
+                          >
+                            {persona.name[0]}
+                          </div>
+                          <div>
+                            <strong>{persona.name}</strong>
+                            <span>
+                              {persona.role} · {persona.network}
+                            </span>
+                          </div>
+                          {persona.personaKind === "demotion-authority" && (
+                            <ShieldCheck size={13} />
+                          )}
+                        </button>
+                      ))}
+                      {NAMES.some((name) =>
+                        !personas.some((persona) => persona.name === name)
+                      ) && (
+                        <button
+                          className="new-persona-option"
+                          onClick={() => addPersona()}
+                        >
+                          <Plus size={14} /> Create next standard user
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
             </section>
           </main>
@@ -1870,6 +2328,25 @@ function App() {
               requestId,
               approved,
             )}
+          onSetDemotionAuthority={(authorityUserId) =>
+            setDemotionAuthority(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              authorityUserId,
+            )}
+          onEnableDemotion={(authorityUserId) =>
+            enableDemotion(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              authorityUserId,
+            )}
+          onResolveDemotionApproval={(requestId, approved) =>
+            resolveDemotionApproval(
+              accessModal.user!.id,
+              accessModal.item!.id,
+              requestId,
+              approved,
+            )}
           onUpdateCopy={(patch) =>
             accessModal.viewingUser &&
             updatePromotedCopy(
@@ -1931,7 +2408,8 @@ function RulesPage({
       statement:
         "Down-network distribution is deliberate, destination-specific, and protected by local review.",
       details: [
-        "Demotion requires local owner approvals to be enabled.",
+        "Demotion requires local owner approvals and a same-network Demotion Approval Authority.",
+        "Assignment shares the item with the authority; later source changes wait for their decision.",
         "The receiving network sees Approved for release, never the source network.",
         "Promotion and demotion can operate at the same time.",
       ],
@@ -1956,7 +2434,7 @@ function RulesPage({
         "Approval requests exist only between Editors and the owner of the same network state.",
       details: [
         "Owners approve or deny date and dependency proposals.",
-        "Owners' own changes are inherently approved.",
+        "Changes to a demoted source require a second release-authority decision.",
         "Remote versions are reconciled, not approved or denied.",
       ],
     },
@@ -2109,6 +2587,7 @@ function RulesPage({
         <ol>
           {[
             "Nothing flows down-network unless demotion is enabled.",
+            "Every demotion release is decided by its assigned authority.",
             "Cross-network edits never become approval requests.",
             "Matching states never create conflict noise.",
             "Viewers cannot mutate dates, sharing, or governance.",
@@ -2247,7 +2726,7 @@ function BrowserWindow({
     ownerId: string;
     ownerName: string;
     origin: Network;
-    copyType: "promoted" | "demoted" | "shared";
+    copyType: "promoted" | "demoted" | "shared" | "authority";
     copyOutOfSync: boolean;
     differences: string[];
     promotionConflict: boolean;
@@ -2269,7 +2748,7 @@ function BrowserWindow({
     ownerId: string,
     editorUserId: string,
     requiresApproval: boolean,
-    copyType?: "promoted" | "demoted" | "shared" | null,
+    copyType?: "promoted" | "demoted" | "shared" | "authority" | null,
   ) => void;
   onStartLink: (itemId: string) => void;
 }) {
@@ -2281,7 +2760,7 @@ function BrowserWindow({
       moved: boolean;
       ownerId: string;
       requiresApproval: boolean;
-      copyType: "promoted" | "demoted" | "shared" | null;
+      copyType: "promoted" | "demoted" | "shared" | "authority" | null;
     } | null
   >(null);
   const suppressClickRef = useRef<string | null>(null);
@@ -2290,6 +2769,7 @@ function BrowserWindow({
       item,
       isOffNetwork: false,
       isSharedItem: false,
+      isAuthorityItem: false,
       canWrite: true,
       ownerId: persona.id,
       ownerName: persona.name,
@@ -2315,8 +2795,9 @@ function BrowserWindow({
         permission,
       }) => ({
         item,
-        isOffNetwork: copyType !== "shared",
+        isOffNetwork: copyType === "promoted" || copyType === "demoted",
         isSharedItem: copyType === "shared",
+        isAuthorityItem: copyType === "authority",
         canWrite: permission === "write",
         ownerId,
         ownerName,
@@ -2330,6 +2811,11 @@ function BrowserWindow({
       }),
     ),
   ];
+  const authorityPendingCount = sharedItems.reduce(
+    (total, shared) =>
+      total + (shared.item.pendingDemotionApprovals?.length ?? 0),
+    0,
+  );
 
   function applyDragPosition(clientX: number) {
     const drag = dragRef.current;
@@ -2367,7 +2853,7 @@ function BrowserWindow({
     canWrite: boolean,
     ownerId: string,
     requiresApproval: boolean,
-    copyType: "promoted" | "demoted" | "shared" | null,
+    copyType: "promoted" | "demoted" | "shared" | "authority" | null,
   ) {
     if (!canWrite) return;
     const trackWidth = event.currentTarget.parentElement?.clientWidth ?? 1;
@@ -2455,13 +2941,34 @@ function BrowserWindow({
       </div>
       <div className="schedule-toolbar">
         <div>
-          <strong>Integrated delivery plan</strong>
-          <span>FY26 · Q3–Q4</span>
+          <strong>
+            {persona.personaKind === "demotion-authority"
+              ? "Demotion release queue"
+              : "Integrated delivery plan"}
+          </strong>
+          <span>
+            {persona.personaKind === "demotion-authority"
+              ? `${persona.network} · Assigned governed items`
+              : "FY26 · Q3–Q4"}
+          </span>
         </div>
         <div className="schedule-stats">
-          <span>{persona.items.length} objects</span>
-          {sharedItems.length > 0 && <span>+{sharedItems.length} shared</span>}
-          <span>{persona.dependencies.length} links</span>
+          {persona.personaKind === "demotion-authority"
+            ? (
+              <>
+                <span>{sharedItems.length} governed</span>
+                <span>{authorityPendingCount} pending</span>
+              </>
+            )
+            : (
+              <>
+                <span>{persona.items.length} objects</span>
+                {sharedItems.length > 0 && (
+                  <span>+{sharedItems.length} shared</span>
+                )}
+                <span>{persona.dependencies.length} links</span>
+              </>
+            )}
         </div>
       </div>
       <div className="timeline">
@@ -2522,6 +3029,7 @@ function BrowserWindow({
             item,
             isOffNetwork,
             isSharedItem,
+            isAuthorityItem,
             canWrite,
             ownerId,
             ownerName,
@@ -2536,7 +3044,7 @@ function BrowserWindow({
           <div
             className={`schedule-row ${isOffNetwork ? "off-network-row" : ""} ${
               isSharedItem ? "same-network-row" : ""
-            }`}
+            } ${isAuthorityItem ? "authority-row" : ""}`}
             key={`${ownerName}-${item.id}`}
           >
             <button
@@ -2544,7 +3052,7 @@ function BrowserWindow({
                 linkingSource === item.id ? "is-source" : ""
               } ${isOffNetwork ? "is-provenance" : ""} ${
                 isSharedItem ? "is-shared" : ""
-              }`}
+              } ${isAuthorityItem ? "is-authority" : ""}`}
               onClick={() => openItem(item.id, ownerId, canWrite)}
               title={!canWrite
                 ? READ_ONLY_REASON
@@ -2554,9 +3062,13 @@ function BrowserWindow({
                   : `Synced copy promoted from ${origin} · Owned by ${ownerName}`
                 : isSharedItem
                 ? `Shared by ${ownerName} on ${origin}`
+                : isAuthorityItem
+                ? `Demotion approvals for ${ownerName}`
                 : undefined}
             >
-              {isSharedItem
+              {isAuthorityItem
+                ? <ShieldCheck size={11} className="authority-item-icon" />
+                : isSharedItem
                 ? <Users size={11} className="shared-item-icon" />
                 : isOffNetwork
                 ? copyType === "demoted"
@@ -2568,13 +3080,19 @@ function BrowserWindow({
                 ? <ChevronRight size={12} />
                 : <span className="branch-glyph">└</span>}
               <span>{item.name}</span>
-              {(isOffNetwork || isSharedItem ||
+              {(isOffNetwork || isSharedItem || isAuthorityItem ||
                 (item.pendingApprovals?.length ?? 0) > 0 ||
+                (item.pendingDemotionApprovals?.length ?? 0) > 0 ||
                 (item.demotionOutOfSync && !isSharedItem) || copyOutOfSync ||
                 promotionConflict) && (
                 <div className="row-statuses">
                   {isSharedItem && (
                     <small className="sync-copy-chip shared">Shared</small>
+                  )}
+                  {isAuthorityItem && (
+                    <small className="sync-copy-chip authority">
+                      Authority
+                    </small>
                   )}
                   {isOffNetwork && (
                     <small
@@ -2594,6 +3112,21 @@ function BrowserWindow({
                     >
                       <Clock3 size={10} />
                       {item.pendingApprovals!.length}
+                    </span>
+                  )}
+                  {(item.pendingDemotionApprovals?.length ?? 0) > 0 && (
+                    <span
+                      className="pending-approval-icon authority"
+                      title={`${
+                        item.pendingDemotionApprovals!.length
+                      } demotion approval${
+                        isAuthorityItem
+                          ? " waiting for your decision"
+                          : " pending"
+                      }`}
+                    >
+                      <Clock3 size={10} />
+                      {item.pendingDemotionApprovals!.length}
                     </span>
                   )}
                   {((item.demotionOutOfSync && !isSharedItem) ||
@@ -2722,6 +3255,7 @@ function SettingsModal({ persona, onClose, onUpdate }: {
   onClose: () => void;
   onUpdate: (patch: Partial<Persona>) => void;
 }) {
+  const isAuthority = persona.personaKind === "demotion-authority";
   return (
     <ModalShell
       title="Configure user session"
@@ -2748,6 +3282,7 @@ function SettingsModal({ persona, onClose, onUpdate }: {
         <label className="field">
           <span>Organization</span>
           <input
+            disabled={isAuthority}
             list="organizations"
             value={persona.organization}
             onChange={(event) => onUpdate({ organization: event.target.value })}
@@ -2759,6 +3294,7 @@ function SettingsModal({ persona, onClose, onUpdate }: {
         <label className="field">
           <span>Network</span>
           <select
+            disabled={isAuthority}
             value={persona.network}
             onChange={(event) =>
               onUpdate({ network: event.target.value as Network })}
@@ -2779,9 +3315,9 @@ function SettingsModal({ persona, onClose, onUpdate }: {
           ))}
         </div>
         <div className="info-callout">
-          <Info size={15} />{" "}
-          Network placement determines valid promotion and demotion
-          destinations.
+          <Info size={15} /> {isAuthority
+            ? "Approval authorities are fixed to their designated network and role."
+            : "Network placement determines valid promotion and demotion destinations."}
         </div>
       </div>
       <div className="modal-footer">
@@ -2804,6 +3340,9 @@ function AccessModal({
   onReconcilePromotion,
   onSyncToDemotedState,
   onResetLocalDemotedCopy,
+  onSetDemotionAuthority,
+  onEnableDemotion,
+  onResolveDemotionApproval,
   onUpdateCopy,
   onUpdate,
 }: {
@@ -2817,13 +3356,43 @@ function AccessModal({
   onReconcilePromotion: (stateId: string | "local") => void;
   onSyncToDemotedState: () => void;
   onResetLocalDemotedCopy: () => void;
+  onSetDemotionAuthority: (authorityUserId: string) => void;
+  onEnableDemotion: (authorityUserId: string) => void;
+  onResolveDemotionApproval: (
+    requestId: string,
+    approved: boolean,
+  ) => void;
   onUpdateCopy: (patch: Partial<PromotedCopySnapshot>) => void;
   onUpdate: (patch: Partial<ScheduleItem>) => void;
 }) {
   const [showSyncChanges, setShowSyncChanges] = useState(false);
   const [showPeoplePicker, setShowPeoplePicker] = useState(false);
   const [selectedPeople, setSelectedPeople] = useState<string[]>([]);
+  const [demotionIntent, setDemotionIntent] = useState(
+    Boolean(item.demotion || item.demotionRequested),
+  );
+  const [selectedDemotionAuthority, setSelectedDemotionAuthority] = useState(
+    item.demotionAuthorityUserId ?? "",
+  );
   const originLevel = NETWORKS.indexOf(owner.network);
+  const eligibleDemotionAuthorities = personas.filter((persona) =>
+    persona.personaKind === "demotion-authority" &&
+    persona.network === owner.network
+  );
+  const assignedDemotionAuthority = personas.find((persona) =>
+    persona.id === item.demotionAuthorityUserId
+  );
+  const displayedDemotionAuthority = personas.find((persona) =>
+    persona.id === selectedDemotionAuthority
+  );
+  const isDemotionAuthority = Boolean(
+    viewingUser &&
+      viewingUser.id === item.demotionAuthorityUserId &&
+      viewingUser.personaKind === "demotion-authority",
+  );
+  const needsDemotionAuthority = Boolean(
+    !viewingUser && demotionIntent && !selectedDemotionAuthority,
+  );
   const isCrossNetworkView = Boolean(
     viewingUser && viewingUser.network !== owner.network,
   );
@@ -2877,6 +3446,13 @@ function AccessModal({
   const isReadOnly = Boolean(
     viewingUser && viewerPermission !== "write",
   );
+  const demotionDisabledReason = viewingUser
+    ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_DEMOTION_REASON
+    : !item.approvals
+    ? "Enable Owner approvals before requesting demotion."
+    : originLevel === 0
+    ? "Commercial is the lowest network, so this item cannot be demoted."
+    : undefined;
   const canManagePromotion = !viewingUser ||
     (isPromotedCopyView && !isReadOnly);
   const accessOwner = isPromotedCopyView && viewingUser ? viewingUser : owner;
@@ -3044,29 +3620,56 @@ function AccessModal({
     if (selectedPeople.length > 0) {
       addSelectedPeople();
     }
+    if (
+      selectedDemotionAuthority &&
+      selectedDemotionAuthority !== item.demotionAuthorityUserId
+    ) {
+      onSetDemotionAuthority(selectedDemotionAuthority);
+    }
+    if (
+      demotionIntent &&
+      selectedDemotionAuthority &&
+      !item.demotion
+    ) {
+      onEnableDemotion(selectedDemotionAuthority);
+    }
     onClose();
+  }
+
+  function chooseDemotionAuthority(authorityUserId: string) {
+    setSelectedDemotionAuthority(authorityUserId);
   }
 
   function setMovement(kind: "promotion" | "demotion", enabled: boolean) {
     if (isReadOnly) return;
     if (kind === "promotion" && viewingUser && !isPromotedCopyView) return;
-    if (kind === "demotion" && viewingUser) return;
-    if (kind === "demotion" && !item.approvals && enabled) return;
+    if (kind === "demotion") {
+      if (viewingUser || (!item.approvals && enabled)) return;
+      setDemotionIntent(enabled);
+      if (enabled) {
+        const valid = NETWORKS.filter((_, index) => index < originLevel);
+        onUpdate({
+          destination: valid.includes(item.destination)
+            ? item.destination
+            : valid.at(-1) ?? owner.network,
+        });
+      } else {
+        onUpdate({
+          demotion: false,
+          demotionRequested: false,
+          pendingDemotionApprovals: [],
+        });
+      }
+      return;
+    }
     if (kind === "promotion" && isPromotedCopyView) {
       updateLocalCopy({ promotion: enabled });
       return;
     }
-    const valid = NETWORKS.filter((_, index) =>
-      kind === "promotion" ? index > originLevel : index < originLevel
-    );
     onUpdate({
-      promotion: kind === "promotion" ? enabled : item.promotion,
-      demotion: kind === "demotion" ? enabled : item.demotion,
-      destination: kind === "demotion" && enabled
-        ? valid.includes(item.destination)
-          ? item.destination
-          : valid.at(-1) ?? owner.network
-        : item.destination,
+      promotion: enabled,
+      demotion: item.demotion,
+      destination: item.destination,
     });
   }
 
@@ -3083,7 +3686,7 @@ function AccessModal({
       onClose={onClose}
     >
       <div className="modal-body access-body">
-        {isReadOnly && (
+        {isReadOnly && !isDemotionAuthority && (
           <div className="read-only-banner" title={READ_ONLY_REASON}>
             <LockKeyhole size={16} />
             <div>
@@ -3091,6 +3694,18 @@ function AccessModal({
               <span>
                 You can inspect this object, but editing, sharing, approvals,
                 and dependencies are locked.
+              </span>
+            </div>
+          </div>
+        )}
+        {isDemotionAuthority && (
+          <div className="authority-view-banner">
+            <ShieldCheck size={17} />
+            <div>
+              <strong>Demotion approval authority view</strong>
+              <span>
+                You can inspect this governed item and decide whether queued
+                changes are approved for down-network release.
               </span>
             </div>
           </div>
@@ -3337,78 +3952,89 @@ function AccessModal({
               </div>
             </div>
           )}
-        {((item.approvals && !isCrossNetworkView) ||
-          visibleApprovals.length > 0) && (
-          <section className="control-section approval-queue">
+        {(isDemotionAuthority ||
+          (!viewingUser &&
+            (item.pendingDemotionApprovals?.length ?? 0) > 0)) && (
+          <section className="control-section demotion-approval-queue">
             <div className="section-heading">
               <div>
-                <Clock3 size={17} />
+                <ShieldCheck size={17} />
                 <div>
-                  <strong>Change approvals</strong>
+                  <strong>Demotion release approvals</strong>
                   <span>
-                    {viewingUser
-                      ? "Changes wait for the owner before syncing."
-                      : "Review changes submitted by editors."}
+                    {isDemotionAuthority
+                      ? "Approve or deny changes before they flow down-network."
+                      : "Changes are waiting for the assigned release authority."}
                   </span>
                 </div>
               </div>
-              <span className="count-chip">{visibleApprovals.length}</span>
+              <span className="count-chip">
+                {item.pendingDemotionApprovals?.length ?? 0}
+              </span>
             </div>
             <div className="approval-list">
-              {visibleApprovals.length === 0
+              {(item.pendingDemotionApprovals?.length ?? 0) === 0
                 ? (
                   <span className="empty-connections">
-                    No changes awaiting approval
+                    No demotion changes awaiting approval
                   </span>
                 )
-                : visibleApprovals.map((request) => {
-                  const editor = personas.find((persona) =>
-                    persona.id === request.editorUserId
+                : item.pendingDemotionApprovals!.map((request) => {
+                  const submitter = personas.find((persona) =>
+                    persona.id === request.submittedByUserId
                   );
-                  const delta = (request.requestedStart ?? item.start) -
-                    item.start;
-                  const days = Math.max(1, Math.round(Math.abs(delta) * 1.2));
+                  const requestedDelta = request.requestedStart === undefined
+                    ? 0
+                    : request.requestedStart - item.start;
+                  const days = Math.max(
+                    1,
+                    Math.round(Math.abs(requestedDelta) * 1.2),
+                  );
+                  const requestLabel = request.kind === "enable"
+                    ? "Enable demotion and release the first snapshot"
+                    : request.kind === "dependency"
+                    ? "Release a dependency change"
+                    : `Release a date change ${days} days ${
+                      requestedDelta >= 0 ? "later" : "earlier"
+                    }`;
                   return (
                     <div className="approval-row" key={request.id}>
                       <div
                         className="mini-avatar"
-                        style={{ background: editor?.accent }}
+                        style={{ background: submitter?.accent }}
                       >
-                        {editor?.name[0] ?? "E"}
+                        {submitter?.name[0] ?? "U"}
                       </div>
                       <div className="approval-detail">
-                        <strong>{editor?.name ?? "Editor"}</strong>
+                        <strong>{requestLabel}</strong>
                         <span>
-                          {request.kind === "dependency"
-                            ? "Add dependency"
-                            : `Move ${days} days ${
-                              delta >= 0 ? "later" : "earlier"
-                            }`} · Sent {formatSyncTime(request.submittedAt)}
+                          {submitter?.name ?? "Source owner"} · Sent{" "}
+                          {formatSyncTime(request.submittedAt)}
                         </span>
                       </div>
-                      {viewingUser
+                      {isDemotionAuthority
                         ? (
-                          <span className="awaiting-chip">
-                            <Clock3 size={9} /> Awaiting owner
-                          </span>
-                        )
-                        : (
                           <div className="approval-actions">
                             <button
                               className="deny"
                               onClick={() =>
-                                onResolveApproval(request.id, false)}
+                                onResolveDemotionApproval(request.id, false)}
                             >
                               <X size={12} /> Deny
                             </button>
                             <button
                               className="approve"
                               onClick={() =>
-                                onResolveApproval(request.id, true)}
+                                onResolveDemotionApproval(request.id, true)}
                             >
                               <Check size={12} /> Approve
                             </button>
                           </div>
+                        )
+                        : (
+                          <span className="awaiting-chip">
+                            <Clock3 size={9} /> Awaiting authority
+                          </span>
                         )}
                     </div>
                   );
@@ -3416,6 +4042,87 @@ function AccessModal({
             </div>
           </section>
         )}
+        {!isDemotionAuthority &&
+          ((item.approvals && !isCrossNetworkView) ||
+            visibleApprovals.length > 0) &&
+          (
+            <section className="control-section approval-queue">
+              <div className="section-heading">
+                <div>
+                  <Clock3 size={17} />
+                  <div>
+                    <strong>Change approvals</strong>
+                    <span>
+                      {viewingUser
+                        ? "Changes wait for the owner before syncing."
+                        : "Review changes submitted by editors."}
+                    </span>
+                  </div>
+                </div>
+                <span className="count-chip">{visibleApprovals.length}</span>
+              </div>
+              <div className="approval-list">
+                {visibleApprovals.length === 0
+                  ? (
+                    <span className="empty-connections">
+                      No changes awaiting approval
+                    </span>
+                  )
+                  : visibleApprovals.map((request) => {
+                    const editor = personas.find((persona) =>
+                      persona.id === request.editorUserId
+                    );
+                    const delta = (request.requestedStart ?? item.start) -
+                      item.start;
+                    const days = Math.max(1, Math.round(Math.abs(delta) * 1.2));
+                    return (
+                      <div className="approval-row" key={request.id}>
+                        <div
+                          className="mini-avatar"
+                          style={{ background: editor?.accent }}
+                        >
+                          {editor?.name[0] ?? "E"}
+                        </div>
+                        <div className="approval-detail">
+                          <strong>{editor?.name ?? "Editor"}</strong>
+                          <span>
+                            {request.kind === "dependency"
+                              ? "Add dependency"
+                              : `Move ${days} days ${
+                                delta >= 0 ? "later" : "earlier"
+                              }`} · Sent {formatSyncTime(request.submittedAt)}
+                          </span>
+                        </div>
+                        {viewingUser
+                          ? (
+                            <span className="awaiting-chip">
+                              <Clock3 size={9} /> Awaiting owner
+                            </span>
+                          )
+                          : (
+                            <div className="approval-actions">
+                              <button
+                                className="deny"
+                                onClick={() =>
+                                  onResolveApproval(request.id, false)}
+                              >
+                                <X size={12} /> Deny
+                              </button>
+                              <button
+                                className="approve"
+                                onClick={() =>
+                                  onResolveApproval(request.id, true)}
+                              >
+                                <Check size={12} /> Approve
+                              </button>
+                            </div>
+                          )}
+                      </div>
+                    );
+                  })}
+              </div>
+            </section>
+          )}
         <section
           className={`control-section ${isReadOnly ? "permission-locked" : ""}`}
           title={isReadOnly ? READ_ONLY_REASON : undefined}
@@ -3467,7 +4174,11 @@ function AccessModal({
                         {persona.name}
                         {viewingUser?.id === persona.id ? " (you)" : ""}
                       </strong>
-                      <span>{persona.organization} · {persona.network}</span>
+                      <span>
+                        {persona.personaKind === "demotion-authority"
+                          ? `${persona.role} · ${persona.network}`
+                          : `${persona.organization} · ${persona.network}`}
+                      </span>
                     </div>
                     {selectedPeople.includes(persona.id) && <Check size={13} />}
                   </label>
@@ -3548,7 +4259,11 @@ function AccessModal({
                       {persona.name}
                       {viewingUser?.id === persona.id ? " (you)" : ""}
                     </strong>
-                    <span>{persona.organization} · {persona.network}</span>
+                    <span>
+                      {persona.personaKind === "demotion-authority"
+                        ? `${persona.role} · ${persona.network}`
+                        : `${persona.organization} · ${persona.network}`}
+                    </span>
                   </div>
                   <select
                     disabled={isReadOnly}
@@ -3565,6 +4280,75 @@ function AccessModal({
               );
             })}
           </div>
+          {(demotionIntent || item.demotion || item.demotionRequested) && (
+            <div className="demotion-authority-slot">
+              <div className="demotion-authority-heading">
+                <ShieldCheck size={15} />
+                <div>
+                  <strong>Demotion approval authority</strong>
+                  <span>
+                    Required before this object can release changes
+                    down-network.
+                  </span>
+                </div>
+                {item.demotionRequested && assignedDemotionAuthority && (
+                  <span className="awaiting-chip">
+                    <Clock3 size={9} /> Awaiting authority
+                  </span>
+                )}
+                {item.demotionRequested && !assignedDemotionAuthority && (
+                  <span className="authority-required-chip">
+                    Authority required
+                  </span>
+                )}
+              </div>
+              {displayedDemotionAuthority && (
+                <div className="access-row authority-assignment-row">
+                  <div
+                    className="mini-avatar"
+                    style={{ background: displayedDemotionAuthority.accent }}
+                  >
+                    {displayedDemotionAuthority.name[0]}
+                  </div>
+                  <div className="access-person">
+                    <strong>
+                      {displayedDemotionAuthority.name}
+                      {isDemotionAuthority ? " (you)" : ""}
+                    </strong>
+                    <span>
+                      {displayedDemotionAuthority.organization} ·{" "}
+                      {displayedDemotionAuthority.network}
+                    </span>
+                  </div>
+                  <span className="authority-chip">
+                    Demotion approval authority
+                  </span>
+                </div>
+              )}
+              {!viewingUser && (
+                <label className="authority-picker-field">
+                  <span>Assign authority</span>
+                  <select
+                    value={selectedDemotionAuthority}
+                    onChange={(event) =>
+                      chooseDemotionAuthority(event.target.value)}
+                  >
+                    <option value="">Select an authority…</option>
+                    {eligibleDemotionAuthorities.map((authority) => (
+                      <option key={authority.id} value={authority.id}>
+                        {authority.name} - {authority.network}{" "}
+                        - Demotion Authority
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    Only same-network users with the Demotion Approval Authority
+                    role are eligible.
+                  </small>
+                </label>
+              )}
+            </div>
+          )}
         </section>
 
         <section
@@ -3646,6 +4430,12 @@ function AccessModal({
                     approvals,
                     promotion: item.promotion,
                     demotion: approvals ? item.demotion : false,
+                    demotionRequested: approvals
+                      ? item.demotionRequested
+                      : false,
+                    pendingDemotionApprovals: approvals
+                      ? item.pendingDemotionApprovals
+                      : [],
                   })}
               />
             </div>
@@ -3687,9 +4477,7 @@ function AccessModal({
           className={`control-section policy ${
             !item.approvals || viewingUser ? "disabled-section" : ""
           }`}
-          title={viewingUser
-            ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_DEMOTION_REASON
-            : undefined}
+          title={demotionDisabledReason}
         >
           <div className="section-heading">
             <div>
@@ -3703,16 +4491,14 @@ function AccessModal({
               label="Demotion"
               disabled={Boolean(viewingUser) || !item.approvals ||
                 originLevel === 0}
-              disabledReason={viewingUser
-                ? isReadOnly ? READ_ONLY_REASON : OWNER_ONLY_DEMOTION_REASON
-                : undefined}
+              disabledReason={demotionDisabledReason}
               checked={item.demotion}
               onChange={(next) => setMovement("demotion", next)}
             />
           </div>
         </section>
 
-        {item.demotion && (
+        {(item.demotion || item.demotionRequested || demotionIntent) && (
           <label
             className={`field destination-field ${
               isReadOnly ? "permission-locked" : ""
@@ -3756,7 +4542,13 @@ function AccessModal({
       </div>
       <div className="modal-footer">
         <span>
-          {isReadOnly
+          {isDemotionAuthority
+            ? (
+              <>
+                <ShieldCheck size={14} /> Approval authority view
+              </>
+            )
+            : isReadOnly
             ? (
               <>
                 <LockKeyhole size={14} /> View-only access
@@ -3764,13 +4556,30 @@ function AccessModal({
             )
             : (
               <>
-                <Save size={14} /> Changes save automatically
+                {needsDemotionAuthority
+                  ? <ShieldCheck size={14} />
+                  : <Save size={14} />}
+                {needsDemotionAuthority
+                  ? "Assign an authority to continue"
+                  : "Changes save automatically"}
               </>
             )}
         </span>
-        <button className="primary-button" onClick={applyControlsAndClose}>
-          <Check size={16} /> {isReadOnly ? "Done" : "Apply controls"}
-        </button>
+        <div
+          className="modal-apply-wrapper"
+          title={needsDemotionAuthority
+            ? "Assign a same-network Demotion Approval Authority before saving."
+            : undefined}
+        >
+          <button
+            className="primary-button"
+            disabled={needsDemotionAuthority}
+            onClick={applyControlsAndClose}
+          >
+            <Check size={16} />{" "}
+            {isReadOnly || isDemotionAuthority ? "Done" : "Apply controls"}
+          </button>
+        </div>
       </div>
     </ModalShell>
   );

@@ -29,23 +29,26 @@ These rules take precedence when features conflict:
 
 1. A lower network must never learn about an unreleased higher-network change.
 2. Promotion does not require approvals.
-3. Demotion requires owner approvals.
-4. Approval requests apply only to editors changing a state on the same network
+3. Demotion requires owner approvals and an assigned same-network Demotion
+   Approval Authority.
+4. Assigning the authority enables the first demotion without an approval
+   request; every later source change requires release-authority approval.
+5. Approval requests apply only to editors changing a state on the same network
    as that state's owner.
-5. Cross-network edits create local divergence and reconciliation choices, never
+6. Cross-network edits create local divergence and reconciliation choices, never
    approval requests.
-6. Promotion creates higher-network synced copies, not shared live objects.
-7. Demotion creates an approved snapshot on one selected lower network.
-8. Promotion and demotion may be active simultaneously and follow their
+7. Promotion creates higher-network synced copies, not shared live objects.
+8. Demotion creates an approved snapshot on one selected lower network.
+9. Promotion and demotion may be active simultaneously and follow their
    independent policy requirements.
-9. Disabling demotion stops all subsequent downward propagation.
-10. A higher-network edit with demotion disabled remains local and creates no
+10. Disabling demotion stops all subsequent downward propagation.
+11. A higher-network edit with demotion disabled remains local and creates no
     low-side approval request or alert.
-11. Approved changes apply atomically to every item in the rigid dependency
+12. Approved changes apply atomically to every item in the rigid dependency
     group.
-12. Denied changes must not alter dates, dependencies, sync timestamps, or
+13. Denied changes must not alter dates, dependencies, sync timestamps, or
     receiving copies.
-13. Read-only users may inspect an item but may not move it or create
+14. Read-only users may inspect an item but may not move it or create
     dependencies.
 
 ## Baseline setup
@@ -392,13 +395,38 @@ Expected:
 2. Attempt to enable demotion.
 3. Turn owner approvals on.
 4. Enable demotion.
+5. Inspect the new authority assignment area.
 
 Expected:
 
 - Demotion is disabled while approvals are off.
-- The UI explains that approvals are required for demotion.
-- Demotion becomes available after approvals are enabled.
+- Hovering the disabled toggle explains that Owner approvals must be enabled.
+- The toggle cannot become active until a Demotion Approval Authority is
+  selected.
+- The authority picker shows only same-network users with the required role.
+- Authority options use the format **Marcus Hale - SIPR - Demotion Authority**.
+- **Apply controls** remains disabled until an authority is selected and
+  explains the requirement on hover.
+- Selecting the authority and applying controls enables demotion without
+  creating an approval request.
+- The authority receives the item immediately with an empty approval queue.
+- Authority personas also remain available through the regular collaborator
+  picker.
 - Promotion remains independent of the approval toggle.
+
+### QA-DEMOTE-01A — Authority browser and inbox
+
+1. Open the add-browser-window picker.
+2. Select the assigned Demotion Approval Authority.
+
+Expected:
+
+- Each NIPR, SIPR, JWICS, and SAP network has a dedicated authority persona.
+- The assigned item appears in the authority's browser without general
+  collaborator access.
+- Pending source changes show an authority badge and count on the row.
+- Opening an item with a pending source change shows Approve and Deny actions.
+- Unassigned items from that network do not appear.
 
 ### QA-DEMOTE-02 — Destination selection
 
@@ -432,9 +460,11 @@ Expected:
 
 Expected:
 
-- The approved snapshot updates after the valid source change.
-- The lower copy moves to the synchronized position.
-- **Last synced** updates.
+- The source object and lower snapshot do not move immediately.
+- A request appears in the assigned authority's browser and item modal.
+- Approving applies the source change and updates the lower snapshot.
+- Denying leaves the source and lower snapshot unchanged.
+- **Last synced** updates only after approval.
 
 ### QA-DEMOTE-05 — Source change after demotion is disabled
 
